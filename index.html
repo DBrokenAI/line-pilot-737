@@ -4588,6 +4588,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
     _freeChunk(c) { for (const k in c.m) this.r.deleteMesh(c.m[k]); }
     *_buildGen(data, terrain) {
       const chunks = []; let count = 0;
+      const cols = [];   // solid footprints for collision: {pts, y0, y1, bb}
       const groups = new Map(); // chunk key -> {g: {punch, glass, metal, park, roofs, plain}: Geo, cx, cz}
       const CH = 1500;
       let seed = 1; const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
@@ -4618,7 +4619,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
         let G = groups.get(key);
         if (!G) { G = { g: { punch: new Eng.Geo(), glass: new Eng.Geo(), metal: new Eng.Geo(), park: new Eng.Geo(), roofs: new Eng.Geo(), plain: new Eng.Geo() }, cx: (Math.floor(cx / CH) + 0.5) * CH, cz: (Math.floor(cz / CH) + 0.5) * CH }; groups.set(key, G); }
         const mat = matOf(tags, h), gw = G.g[mat];
-        if (gw.vcount > 60000 || G.g.roofs.vcount > 60000) return;
+        const VCAP = this.isNYC ? 400000 : 60000; if (gw.vcount > VCAP || G.g.roofs.vcount > VCAP) return;
         const rv = rnd();
         const col = colorOf(tags, rv);
         // glass and metal carry their own colour in the texture: keep the vertex tint near white
@@ -4650,7 +4651,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
         }
         // rooftop plant on bigger flat roofs (HVAC units, vents)
         const area = A2 / 2;
-        if (area > 250 && mat !== 'park') {
+        if (area > 250 && mat !== 'park' && !tags._noplant) {
           let mnx = 1e9, mxx = -1e9, mnz = 1e9, mxz = -1e9; for (const p of pts) { mnx = Math.min(mnx, p[0]); mxx = Math.max(mxx, p[0]); mnz = Math.min(mnz, p[1]); mxz = Math.max(mxz, p[1]); }
           const n = Math.min(8, Math.floor(area / 350) + 1);
           for (let k = 0, tries = 0; k < n && tries < n * 4; tries++) {
@@ -4661,6 +4662,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
             k++;
           }
         }
+        if (!ap) { let a0 = 1e9, b0 = 1e9, a1 = -1e9, b1 = -1e9; for (const p of pts) { a0 = Math.min(a0, p[0]); b0 = Math.min(b0, p[1]); a1 = Math.max(a1, p[0]); b1 = Math.max(b1, p[1]); } cols.push({ pts, y0: base, y1, bb: [a0, b0, a1, b1] }); }
         count++;
       };
       let ne = 0;
@@ -4682,7 +4684,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
       } finally { if (!done) for (const c of chunks) this._freeChunk(c); }   // abandoned: free partial uploads
       // swap in the new set (the old one stays visible until the new one is complete)
       for (const c of this.chunks) this._freeChunk(c);
-      this.chunks = chunks; this.count = count;
+      this.chunks = chunks; this.count = count; this.colGrid = Buildings.gridOf(cols);
     }
     // Shadow-pass safe: with ctx.shadowPass set only the geometry is drawn through the given lit object.
     render(lit, ctx) {
@@ -4720,6 +4722,18 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
       }
     }
   }
+  // ----- collision: footprints in a 200 m grid; hit(x, y, z) = is this point inside a building?
+  Buildings.gridOf = (cols) => {
+    const G = new Map(), C = 200;
+    for (const c of cols) for (let i = Math.floor(c.bb[0] / C); i <= Math.floor(c.bb[2] / C); i++) for (let j = Math.floor(c.bb[1] / C); j <= Math.floor(c.bb[3] / C); j++) { const k = i + ',' + j; let L = G.get(k); if (!L) G.set(k, L = []); L.push(c); }
+    return G;
+  };
+  Buildings.hitGrid = (G, x, y, z) => {
+    if (!G) return null; const L = G.get(Math.floor(x / 200) + ',' + Math.floor(z / 200)); if (!L) return null;
+    for (const c of L) if (y > c.y0 && y < c.y1 && x >= c.bb[0] && x <= c.bb[2] && z >= c.bb[1] && z <= c.bb[3] && inPoly(c.pts, x, z)) return c;
+    return null;
+  };
+  Buildings.prototype.hit = function (x, y, z) { return Buildings.hitGrid(this.colGrid, x, y, z); };
   window.Buildings = Buildings;
   Buildings._earclip = earclip; Buildings._query = query;
 })();
@@ -4847,6 +4861,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
     }
     // extruded prism with walls of material m and a roof of colour rc (material 'plain')
     prism(m, pts, y0, y1, col, rc, vBase) {
+      (this.cols || (this.cols = [])).push({ pts: pts.map((p) => p.slice()), y0, y1 });
       let cx = 0, cz = 0; for (const p of pts) { cx += p[0]; cz += p[1]; } cx /= pts.length; cz /= pts.length;
       let run = 0;
       for (let i = 0; i < pts.length; i++) { const a = pts[i], b = pts[(i + 1) % pts.length]; this.wall(m, a, b, y0, y1, col, cx, cz, run, y0 - (vBase ?? y0)); run += Math.hypot(b[0] - a[0], b[1] - a[1]); }
@@ -4864,6 +4879,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
         g.ftri([a[0], y0, a[1]], [b[0], y0, b[1]], [A[0], y1, A[1]], col);
       }
     }
+    solid(pts, y0, y1) { (this.cols || (this.cols = [])).push({ pts, y0, y1 }); }
     spire(m, x, z, y0, y1, r0, r1, seg, col) { this.geo(m).cyl([x, y0, z], [x, y1, z], r0, r1, seg || 6, col, true); }
     box(m, x, y, z, sx, sy, sz, rot, col) { this.geo(m).box([x, y, z], [sx, sy, sz], col, Eng.Q.axisAngle([0, 1, 0], -rot * D2R)); }
     build(r) { const out = {}; for (const k in this.g) if (this.g[k].vcount) out[k] = this.g[k].build(r); return out; }
@@ -5038,6 +5054,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
           const a = at(u0, -13), bq = at(u1, -13), c = at(u1, 13), d = at(u0, 13);
           K.geo('plain').fquad([a[0], y0, a[1]], [d[0], y0, d[1]], [c[0], y1, c[1]], [bq[0], y1, bq[1]], [0.5, 0.48, 0.45]);
           K.geo('plain').fquad([a[0], y0 - 3, a[1]], [bq[0], y1 - 3, bq[1]], [c[0], y1 - 3, c[1]], [d[0], y0 - 3, d[1]], [0.3, 0.29, 0.28]);
+          K.solid([a, bq, c, d], Math.min(y0, y1) - 3, Math.max(y0, y1) + 1.5);
           for (const v of [-13, 13]) { const p = at(u0, v), q = at(u1, v); K.wall('plain', p, q, Math.min(y0, y1) - 3, Math.max(y0, y1) + 1.2, [0.62, 0.6, 0.55], at((u0 + u1) / 2, 0)[0], at((u0 + u1) / 2, 0)[1]); }
         }
         // main cables (catenary) and vertical suspenders
@@ -5084,6 +5101,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
     _build() {
       for (const it of this.items) for (const k in it.m) this.r.deleteMesh(it.m[k]);
       this.items = []; if (!this.tex) this.tex = textures(this.r);
+      const cols = []; this.wtc = null;
       const era = Landmarks.era();
       for (const L of LANDMARKS) {
         if (L.era === '1990s' && era !== '1990s') continue;
@@ -5091,9 +5109,12 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
         const P = (ll) => { const p = toXZ(ll[0], ll[1]); return [p[0] - c[0], p[1] - c[1]]; };
         try { L.build(K, P, L.base); } catch (e) { console.warn('landmark ' + L.id, e); continue; }
         this.items.push({ L, cx: c[0], cz: c[1], m: K.build(this.r) });
+        if (L.id !== 'wtc') for (const s of K.cols || []) { const pts = s.pts.map((p) => [p[0] + c[0], p[1] + c[1]]); let a0 = 1e9, b0 = 1e9, a1 = -1e9, b1 = -1e9; for (const p of pts) { a0 = Math.min(a0, p[0]); b0 = Math.min(b0, p[1]); a1 = Math.max(a1, p[0]); b1 = Math.max(b1, p[1]); } cols.push({ pts, y0: s.y0, y1: s.y1, bb: [a0, b0, a1, b1], name: L.name }); }
+        if (L.id === 'wtc') this.wtc = [WTC_N, WTC_S].map((ll) => toXZ(ll[0], ll[1])).concat([[L.base]]);
       }
-      this.key = era + '/' + Geo.originVersion;
+      this.key = era + '/' + Geo.originVersion; this.colGrid = Buildings.gridOf(cols);
     }
+    hit(x, y, z) { return Buildings.hitGrid(this.colGrid, x, y, z); }
     near(cam) { const Z = this._zones(); return Math.hypot(cam[0] - Z.nyc[0], cam[2] - Z.nyc[1]) < 120000; }
     // Shadow-pass safe (ctx.shadowPass): only geometry is drawn
     render(lit, ctx) {
@@ -5141,8 +5162,8 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
   const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
   const BANDS = [
     { id: 'tall', deg: 0.05, range: 45000, lo: 90, hi: 1e4 },
-    { id: 'mid', deg: 0.02, range: 9000, lo: 25, hi: 90 },
-    { id: 'low', deg: 0.01, range: 3500, lo: 0, hi: 25 },
+    { id: 'mid', deg: 0.02, range: 15000, lo: 25, hi: 90 },
+    { id: 'low', deg: 0.01, range: 5500, lo: 0, hi: 25 },
   ];
   const FT = 0.3048;
   // field names have changed over the years; try the variants until one works
@@ -5181,7 +5202,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
             for (const poly of polys) { const ring = poly[0]; if (!ring || ring.length < 4) continue; out.push({ h: isFinite(hm) && hm > 2 ? hm : 8, yr: isFinite(yr) ? yr : 0, pts: ring.map((c) => [c[1], c[0]]) }); }
           }
           return out;
-        } catch (e) { last = e.name === 'AbortError' ? 'timed out' : 'blocked'; break; }
+        } catch (e) { last = e.name === 'AbortError' ? 'timed out' : /HTTP/.test(e.message) ? e.message : 'blocked'; break; }
       }
       throw new Error(last);
     }
@@ -5206,22 +5227,36 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
     }
     async _fetch(T) {
       const { band, s, w, n, e } = T;
-      if (this.failSocrata < 3) { try { const d = await this._socrata(band, s, w, n, e); this.failSocrata = 0; this.src = 'NYC Open Data'; return d; } catch (err) { this.failSocrata++; this.lastErr = err.message; } }
-      if (this.failOSM < 3) { try { const d = await this._osm(band, s, w, n, e); this.failOSM = 0; this.src = 'OpenStreetMap'; return d; } catch (err) { this.failOSM++; this.lastErr = err.message; } }
+      const now = Date.now();
+      if (this.failSocrata < 6 || now > (this.retrySocrata || 0)) {
+        for (let k = 0; k < 3; k++) {
+          try { const d = await this._socrata(band, s, w, n, e); this.failSocrata = 0; this.src = 'NYC Open Data'; return d; }
+          catch (err) { this.lastErr = 'NYC Open Data ' + err.message; if (err.message === 'query' || err.message === 'blocked') break; await new Promise((r) => setTimeout(r, 1500 * (k + 1) + Math.random() * 1000)); }   // busy (429/5xx): wait, retry
+        }
+        if (++this.failSocrata >= 6) this.retrySocrata = now + 60000;
+      }
+      if (this.failOSM < 6 || now > (this.retryOSM || 0)) {
+        try { const d = await this._osm(band, s, w, n, e); this.failOSM = 0; this.src = 'OpenStreetMap'; return d; }
+        catch (err) { this.lastErr = (this.lastErr ? this.lastErr + '; ' : '') + 'OpenStreetMap ' + err.message; if (++this.failOSM >= 6) this.retryOSM = now + 60000; }
+      }
       throw new Error(this.lastErr || 'unreachable');
     }
     // turn raw rows into a Buildings mesh set for one tile
     async _mesh(T) {
       const era = Landmarks.era(), L = Landmarks._inst;
       const elements = [];
+      const far = T.band.id === 'low' && T.lod === 'far';
       for (const b of T.raw) {
         if (era === '1990s' && b.yr >= 2001) continue;
+        let pts = b.pts;
+        if (far && pts.length > 7) { const k = Math.ceil((pts.length - 1) / 6), q = []; for (let i = 0; i < pts.length - 1; i += k) q.push(pts[i]); q.push(q[0]); pts = q; }
         const tags = { building: 'yes', height: String(b.h.toFixed(1)) };
         if (b.yr) tags.start_date = String(b.yr);
         // pre-1960: brick and stone; later towers: a mix of glass curtain walls and stone/precast with punched windows
         const hh = Math.abs(Math.sin(b.pts[0][0] * 9301.7 + b.pts[0][1] * 4971.3)) % 1;
         if ((b.yr && b.yr < 1960 && b.h < 150) || (!b.yr && b.h < 40) || (b.h >= 38 && hh < 0.45)) tags._masonry = 1;
-        elements.push({ type: 'way', tags, geometry: b.pts.map((p) => ({ lat: p[0], lon: p[1] })) });
+        if (far) tags._noplant = 1;
+        elements.push({ type: 'way', tags, geometry: pts.map((p) => ({ lat: p[0], lon: p[1] })) });
       }
       const B = T.bld || (T.bld = new Buildings(this.r, this.tex)); B.isNYC = true;
       B.raw = { t: { elements } }; B.ids = ['t']; B.terrain = this.terrain;
@@ -5237,8 +5272,13 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
       const era = Landmarks.era();
       // world origin moved or era switched: rebuild the meshes from the rows we already have
       if (this.ov !== Geo.originVersion || this.era !== era) { this.ov = Geo.originVersion; this.era = era; for (const T of this.tiles.values()) if (T.raw) T.stale = true; }
+      { const mlat0 = 111320, mlon0 = 111320 * Math.cos(clat * Math.PI / 180);
+        for (const T of this.tiles.values()) if (T.band.id === 'low' && T.raw) {
+          const dd = Math.hypot((T.s + 0.005 - clat) * mlat0, (T.w + 0.005 - clon) * mlon0), want = dd < 2300 ? 'near' : dd > 2900 ? 'far' : T.lod;
+          if (want !== T.lod) { T.lod = want; T.stale = true; }
+        } }
       for (const T of this.tiles.values()) if (T.stale && !T.busy) { T.stale = false; T.busy = true; this._mesh(T).finally(() => { T.busy = false; }); break; }
-      if (this.failSocrata >= 3 && this.failOSM >= 3) { this.status = 'blocked (' + (this.lastErr || '') + ')'; return; }
+      if (this.failSocrata >= 6 && this.failOSM >= 6 && Date.now() < Math.min(this.retrySocrata || 0, this.retryOSM || 0)) { this.status = 'can\'t download (' + (this.lastErr || '') + ')'; return; }
       const mlat = 111320, mlon = 111320 * Math.cos(clat * Math.PI / 180);
       for (const band of BANDS) {
         const d = band.deg, rl = band.range / mlat, ro = band.range / mlon;
@@ -5247,7 +5287,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
             const k = band.id + ':' + i + ':' + j; if (this.tiles.has(k)) continue;
             const s = i * d, w = j * d, dist = Math.hypot((s + d / 2 - clat) * mlat, (w + d / 2 - clon) * mlon);
             if (dist > band.range) continue;
-            const T = { k, band, s, w, n: s + d, e: w + d, dist, raw: null, bld: null };
+            const T = { k, band, s, w, n: s + d, e: w + d, dist, raw: null, bld: null, lod: dist < 2600 ? 'near' : 'far' };
             this.tiles.set(k, T); this.queue.push(T);
           }
       }
@@ -5255,7 +5295,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
       if (this.queue.length) {
         for (const T of this.queue) T.dist = Math.hypot((T.s + T.band.deg / 2 - clat) * mlat, (T.w + T.band.deg / 2 - clon) * mlon) / (T.band.id === 'tall' ? 3 : 1);
         this.queue.sort((a, b) => a.dist - b.dist);
-        while (this.active < 4 && this.queue.length) {
+        while (this.active < 3 && this.queue.length) {
           const T = this.queue.shift(); this.active++; this.status = 'loading';
           this._fetch(T).then(async (rows) => { T.raw = rows; await this._mesh(T); this.status = `${this.count} buildings (${this.src})`; })
             .catch(() => { this.tiles.delete(T.k); })
@@ -5270,6 +5310,11 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
       }
     }
     render(lit, ctx) { for (const T of this.tiles.values()) if (T.bld && T.bld.chunks.length) T.bld.render(lit, ctx); }
+    hit(x, y, z) {
+      if (!this.tiles.size) return null; const [lat, lon] = Geo.toLatLon(x, z); if (!NYCCity.inBox(lat, lon)) return null;
+      for (const b of BANDS) { const I = Math.floor(lat / b.deg), J = Math.floor(lon / b.deg); for (let di = -1; di <= 1; di++) for (let dj = -1; dj <= 1; dj++) { const T = this.tiles.get(b.id + ':' + (I + di) + ':' + (J + dj)); if (T && T.bld) { const h = T.bld.hit(x, y, z); if (h) return h; } } }
+      return null;
+    }
   }
   window.NYCCity = NYCCity;
   Landmarks.LIST = LANDMARKS;
@@ -18615,7 +18660,7 @@ void main(){
       // weather (fx.js Weather): cloud layers interpolated dep->arr, storm cells, precipitation, icing, windshear -> this.wxState
       this.wxm = new FX.Weather(); this.wxState = this.wxm.state; this.wxm.setup(this); this.cloudSrc = null;
       this.hideAircraft = false; this.gearCollapsed = false; this._smokeDone = false; this.crashCause = null; this.report = null; this.replayPose = null; this.track = []; this._trackT = 0;
-      this.crashed = false; this.ended = false; this.debris = []; this.fires = []; this.particles.list = []; this.replay = { frames: [], playing: false, t: 0 };
+      this.crashed = false; this.ended = false; this._frozen = false; this.debris = []; this.fires = []; this.particles.list = []; this.replay = { frames: [], playing: false, t: 0 };
       this.view = 'cockpit'; this.camState.smoothPos = null; if (this.cockpit.look) this.cockpit.look('FRONT'); else this.cockpit.head = { yaw: 0, pitch: -15, fov: 68 };
       this.simRate = 1; this.flightTime = 0; this._airReal = 0; this._rateT = 0; this._ghPrev = null; this._ghFix = 0;
       this.autoTime = cfg.airMinutes !== 'real' && cfg.mode !== 'landing' && !(SL && SL.id !== 'checkride');
@@ -19404,6 +19449,7 @@ void main(){
         }
         this.failures.update(h);
         this.logic.onFdmEvents(ac.events, sys.state || {});
+        if (!this.crashed && !this.ended && (!ac.onGround || (sys.state && sys.state.gsKt > 40))) { this._buildingCheck(); if (this.crashed || this.ended) break; }
         if (ac.events.length) this._feelEvents(ac.events);
         this.flightTime += h;
         if (this.crashed) break;
@@ -19462,7 +19508,8 @@ void main(){
         else if (e.type === 'groundSpoilers') au.event('spoilers');
       }
     }
-    simulatePost(dt) { // keep debris/fire animating after the flight ended
+    simulatePost(dt) {
+      if (this._frozen) { this._effects && this._effects(dt); return; } // keep debris/fire animating after the flight ended
       this._effects(dt); if (!this.crashed) { const env = this.env(); this.ac.ctrl.thr.fill(0); this.ac.ctrl.brake = 1; this.sys.update(dt, { pitch: 0, roll: 0, yaw: 0, trim: 0, thrDelta: 0, thrSet: 0, rev: false }, env); this.ac.step(dt, env); }
     }
     _logicEvents() {
@@ -19496,6 +19543,26 @@ void main(){
       this._later(() => this.ui.debrief(report), crash ? 4500 : 1200);
     }
 
+    // buildings are solid: nose, tail, wingtips and belly are tested against every building the player can see
+    _buildingCheck() {
+      const ac = this.ac, d = (this.acType && this.acType.dims) || { length: 39.5, span: 35.8 }, hl = d.length / 2, hs = d.span / 2;
+      const LM = this.landmarks;
+      // the World Trade Center (1990s skyline) is scenery you can fly past, not into: the flight is stopped well before
+      if (LM && LM.wtc) { const base = LM.wtc[2][0]; for (const c of [LM.wtc[0], LM.wtc[1]]) if (Math.hypot(ac.pos[0] - c[0], ac.pos[2] - c[1]) < 110 + hs && ac.pos[1] < base + 535) { this._wtcStop(); return; } }
+      const img = this.terrain.showingImagery();
+      const P = this._bcPts || (this._bcPts = [[0, 0, -1], [0, 0, 1], [-1, 0, 0.1], [1, 0, 0.1], [0, -1.5, 0]]);
+      for (const q of P) {
+        const p = ac.worldPoint([q[0] * hs * 0.95, q[1], q[2] * hl * 0.92]);
+        const h = (LM && LM.hit(p[0], p[1], p[2])) || (this.nycCity && this.nycCity.hit(p[0], p[1], p[2])) || (img && this.buildings && this.buildings.hit(p[0], p[1], p[2]));
+        if (h) { this.crash(h.name ? `The aircraft struck the ${h.name}.` : 'The aircraft struck a building.', 1); return; }
+      }
+    }
+    _wtcStop() {
+      if (this.ended) return;
+      this._frozen = true; this.ac.vel = [0, 0, 0]; this.ac.w = [0, 0, 0];
+      this.ui.toast('Flight ended: you flew too close to the World Trade Center.', 'warn', 9000);
+      this.endFlight(false);
+    }
     // ------------------------------------------------------------ crash & effects
     crash(cause, severity) {
       if (this.crashed) return; this.crashed = true; this.crashCause = cause;
@@ -20696,7 +20763,7 @@ void main(){
       if (game.cfg.netHost && this.net && this.net.connected) this.net.send('plan', { dep: game.dep.apt.id, arr: game.arr.apt.id, metar: { [game.dep.apt.id]: game.wx.dep.raw, [game.arr.apt.id]: game.wx.arr.raw }, simDate: game.simDate.getTime(), failures: game.cfg.failures, airMinutes: game.cfg.airMinutes }); this.hudEl.classList.remove('hidden'); this.setHud(true); this.setView(game.view);
       $('.cs', this.hudEl).textContent = `${game.callsign.text} · ${game.livery.name} ${game.acType && game.typeId !== 'b738' ? game.acType.name.replace(game.acType.maker + ' ', '') : '737-800'} · ${game.dep.apt.id} ${game.dep.id} → ${game.arr.apt.id} ${game.arr.id}`;
       const ws = $('.wxsrc', this.hudEl);
-      const upd = () => { ws.textContent = 'Weather: ' + game.wx.source + ' · ' + game.terrain.status() + (game.buildings ? ' · ' + game.buildings.status : '') + (game.terrain.mode === 'offline' ? ' (click to retry)' : ''); };
+      const upd = () => { ws.textContent = 'Weather: ' + game.wx.source + ' · ' + game.terrain.status() + (game.buildings ? ' · ' + game.buildings.status : '') + (game.nycCity && game.nycCity.status !== 'idle' ? ' · New York: ' + game.nycCity.status : '') + (game.terrain.mode === 'offline' ? ' (click to retry)' : ''); };
       upd(); clearInterval(this._wsT); this._wsT = setInterval(upd, 3000);
       ws.style.cursor = 'pointer'; ws.onclick = () => { if (game.terrain.mode === 'offline') { game.terrain.retry(); this.toast('Retrying real-world map servers…'); upd(); } };
       this.lastAtc = null; $('.atc', this.hudEl).classList.remove('show'); $('.touch', this.hudEl).classList.add('hidden');
