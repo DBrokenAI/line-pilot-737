@@ -12324,9 +12324,9 @@ void main(){
   // a narrowbody course after the regionals needs 20 h; cargo airlines start on the 757F (hire needs 200+ h).
   const LADDER = { regional: 0, turboprop: 0, narrowbody: 1, cargo: 1, widebody: 2, 'cargo widebody': 2 };
   // which types each airline operates (real fleets, 737 first). Unknown airlines fly the 737.
-  const FLEET = { southwest: ['b738'], alaska: ['b738', 'b739', 'a321', 'e175', 'dh8d'], spirit: ['b738', 'a320', 'a321'], united: ['b738', 'b739', 'a320', 'b752', 'b763', 'b789', 'b77w', 'e175', 'crj9'], delta: ['b738', 'b739', 'a320', 'a321', 'b752', 'b763', 'a333', 'a359', 'crj9', 'e175'],
+  const FLEET = { southwest: ['b738'], alaska: ['b738', 'b739', 'a321', 'e175', 'dh8d'], spirit: ['a320', 'a321'], united: ['b738', 'b739', 'a320', 'b752', 'b763', 'b789', 'b77w', 'e175', 'crj9'], delta: ['b738', 'b739', 'a320', 'a321', 'b752', 'b763', 'a333', 'a359', 'crj9', 'e175'],
     american: ['b738', 'a321', 'b789', 'b77w', 'e175', 'crj9'], westjet: ['b738', 'b789'], aircanada: ['b738', 'a320', 'a321', 'a333', 'b789', 'b77w'], aeromexico: ['b738', 'b789'], ryanair: ['b738'], klm: ['b738', 'b739', 'b789', 'b77w', 'a333'], turkish: ['b738', 'b739', 'a321', 'a333', 'a359', 'b789', 'b77w'] };
-  Object.assign(FLEET, { westjet: ['b738', 'b789', 'dh8d'], aircanada: ['b738', 'a320', 'a321', 'a333', 'b789', 'b77w', 'dh8d', 'at76', 'e175'], turkish: ['b738', 'b739', 'a321', 'a333', 'a359', 'b789', 'b77w', 'at76'], american: ['b738', 'a320', 'a321', 'b789', 'b77w', 'e175', 'crj9'],
+  Object.assign(FLEET, { westjet: ['b738', 'b789', 'dh8d'], aircanada: ['b738', 'a320', 'a321', 'a333', 'b789', 'b77w', 'dh8d', 'crj9', 'e175'], turkish: ['b738', 'b739', 'a321', 'a333', 'a359', 'b789', 'b77w', 'at76'], american: ['b738', 'a320', 'a321', 'b789', 'b77w', 'e175', 'crj9'],
     ups: ['b752f', 'b763f', 'md11f', 'b748f'], fedex: ['b752f', 'b763f', 'md11f', 'b77f', 'at76'], atlas: ['b763f', 'b77f', 'b748f'] });
   const TR = {}; for (const t of TYPE_RATINGS) TR[t.id] = t;
   const flyable = (id) => id === 'b738' || !!(window.FleetFly && FleetFly.TYPES && FleetFly.TYPES[id] && FleetFly.TYPES[id].flyable !== false && (!FleetFly.isFlyable || FleetFly.isFlyable(id)));
@@ -12341,7 +12341,12 @@ void main(){
       return { id, name: t.name, cls: t.cls, pay: t.pay, held: c.ratings.indexOf(id) >= 0 || (t.common && c.ratings.indexOf(t.common) >= 0), eligible: !why.length, why, flyable: flyable(id), current: c.type === id }; });
   }
   // type-rating course (sim training) -> rating held; switching type (bidding a new fleet) keeps seniority, as at real airlines
-  function trainType(c, id) { const s = typeStatus(c).find((x) => x.id === id); if (!s || !s.eligible || !s.flyable) return false; if (c.ratings.indexOf(id) < 0) c.ratings.push(id); c.type = id; c.trip = null; sync(c); return true; }
+  // a fleet change only between trips: a started duty day keeps its aircraft (the next legs are scheduled on it)
+  const tripBusy = (c) => !!(c.trip && c.trip.date === c.date && (c.trip.i > 0 || c.trip.legs.some((l) => l.status !== 'sched')));
+  function trainType(c, id) { const s = typeStatus(c).find((x) => x.id === id); if (!s || !(s.eligible || s.held) || !s.flyable) return false; if (tripBusy(c)) return 'busy'; if (c.ratings.indexOf(id) < 0) c.ratings.push(id); c.type = id; c.trip = null; sync(c); return true; }
+  // pick which rated aircraft to fly (today's trip is rebuilt for its range); types you could fly on day one at each airline
+  function selectType(c, id) { const s = typeStatus(c).find((x) => x.id === id); if (!s || !s.held || !s.flyable) return false; if (c.type === id) return true; if (tripBusy(c)) return 'busy'; if (c.ratings.indexOf(id) < 0) c.ratings.push(id); c.type = id; c.trip = null; sync(c); return true; }
+  const entryTypes = (al) => { const f = fleetOf(al).filter((id) => flyable(id)), e = f.filter((id) => !TR[id].req.hours && (LADDER[TR[id].cls] || 0) < 2); return e.length ? e : f.slice(0, 1); };
   const typePay = (c) => (TR[c.type] || TR.b738).pay;
 
   // ---------------------------------------------------------------- ranks & pay ($/block hour, year-1 rate + longevity steps)
@@ -12396,12 +12401,13 @@ void main(){
   }
   function save(c) { c.v = VER; if (!LS.set(KEY, c)) { c.log = c.log.slice(-300); LS.set(KEY, c); } if ((c.legs % 5 === 0) || !c._bak) { LS.set(BAK, c); c._bak = 1; } }
   function reset() { try { localStorage.removeItem(KEY); localStorage.removeItem(BAK); for (const k of OLD_KEYS) localStorage.removeItem(k); } catch (e) { } }
-  function hire(airline, base, name) {
+  function hire(airline, base, name, type) {
     if (!AL[airline]) airline = Object.keys(AL)[0]; if (AL[airline].bases.indexOf(base) < 0) base = AL[airline].bases[0];
     const ds = todayIn(AIRPORTS[base].tz);
     const c = Object.assign(DEF(), { airline, base, name: name || '', hired: ds, alHired: ds, date: ds, airlines: [airline], seed: String(Math.floor(Math.random() * 1e6)) });
     c.senStart = AL[airline].pilots - Math.floor(Math.random() * 40);
     if (fleetOf(airline).indexOf(c.type) < 0) { c.type = fleetOf(airline)[0] || 'b738'; c.ratings = [c.type]; }
+    if (type && entryTypes(airline).indexOf(type) >= 0) { c.type = type; c.ratings = [type]; }
     save(c); return c;
   }
   // bring the career calendar up to today, build today's trip (respecting FAR 117 rest after yesterday)
@@ -12738,7 +12744,7 @@ void main(){
   }
   const stormMetar = (id, r) => { r = r || Math.random; return `${id} ${String(Math.round(18 + r() * 9) * 10).padStart(3, '0')}${pad2(16 + Math.round(r() * 6))}G${30 + Math.round(r() * 8)}KT 3SM +TSRA SCT030CB BKN060 OVC100 ${pad2(20 + Math.round(r() * 5))}/${pad2(18 + Math.round(r() * 2))} A${2960 + Math.round(r() * 15)}`; };
 
-  window.Career = { TYPE_RATINGS, FLEET, fleetOf, typeStatus, trainType, flyable, VER, KEY, AL, NET, AUTH, RANKS, EVT, MEL, ACH, BID_START, BID_LEN, linked, neighbors, netAirports, isIntl, allowed, authority, unlockedAirports, blockMin, flightNo, makeTrip, isWorkDay, rankOf, payRate, longevity, senNo, senPct, award, setBid, load, save, reset, hire, sync, currentLeg,
+  window.Career = { TYPE_RATINGS, FLEET, fleetOf, typeStatus, trainType, selectType, entryTypes, tripBusy, flyable, VER, KEY, AL, NET, AUTH, RANKS, EVT, MEL, ACH, BID_START, BID_LEN, linked, neighbors, netAirports, isIntl, allowed, authority, unlockedAirports, blockMin, flightNo, makeTrip, isWorkDay, rankOf, payRate, longevity, senNo, senPct, award, setBid, load, save, reset, hire, sync, currentLeg,
     upgradeReady, checkrideReady, nextUpgrade, recordLeg, clockOff, nextDutyDay, week, pendingEvent, resolveEvent, rollEvent, dutyCheck, evTitle, canJoin, transfer, changeBase, stats, visited, fdpLimit, ftLimit,
     forecast, wmo, metarFromForecast, stormMetar, todayIn, addDays, dayDiff, localToUTC, localMin, fmtHM, weekday, nm, rng, sanitize, migrate };
 })();
@@ -12789,11 +12795,13 @@ void main(){
     sb.innerHTML = `<div class="jobgrid">
       <section class="today"><h3>${longDate(car.date)}</h3><div class="tripbox"></div><div class="actions jobact"></div><div class="qset"></div></section>
       <section class="nextup"><h3>Next upgrade</h3><div class="nxu"></div></section>
+      <section class="acsel span2"><h3>Aircraft · ${LIV(car.airline).name} fleet</h3><div class="acs"></div></section>
       <section class="weekbox span2"><h3>Roster · this bid period <small class="fcsrc awtxt"></small></h3><div class="week"></div></section>
       <section class="fcwrap span2"><h3>7-day forecast <small class="fcsrc fsrc"></small></h3><div class="fc"></div></section></div>`;
     const tb = $('.tripbox', sb), act = $('.jobact', sb);
     ui._quickSettings($('.qset', sb));
     nextUpgradeBox($('.nxu', sb), car, true);
+    fleetBox(ui, $('.acs', sb), car);
     if (car.suspended) {
       tb.innerHTML = `<div class="notice bad">Suspended pending investigation. Complete a retraining session: a landing practice at ${city(car.base)} with a score of 80 or more.</div>`;
       act.append(h('button', { class: 'btn primary', onclick: () => { ui.jobLeg = { retrain: true }; const near = Object.keys(A).filter((k) => k !== car.base).sort((a, b) => C.nm(a, car.base) - C.nm(b, car.base))[0]; ui.launch({ mode: 'landing', dep: near, arr: car.base, airline: car.airline, acType: car.type || 'b738', livery: null, simDate: null }); } }, 'Start retraining session'));
@@ -12820,6 +12828,24 @@ void main(){
     }
     const ids = [car.base].concat(trip ? trip.legs.map((l) => l.arr) : []).filter((v, i, a) => a.indexOf(v) === i).slice(0, 5);
     ui._forecast($('.fc', sb), $('.fsrc', sb), ids, wEl);
+  }
+  // aircraft you hold a rating for (pick one: today's trip is rebuilt for its range), the rest of the airline's fleet with what it takes
+  const thumb = (id) => window.FleetHD && FleetHD.THUMBS && FleetHD.THUMBS[id];
+  function acCard(id, extra) {
+    const T = window.FleetFly && FleetFly.TYPES[id], th = thumb(id), t = C.TYPE_RATINGS.find((x) => x.id === id) || {};
+    const spec = T ? `${T.engines.n}× ${T.engines.name} · cruise ${T.perf.cruiseMach ? 'M' + T.perf.cruiseMach.toFixed(2).slice(1) : T.perf.cruiseKt + ' kt'} · range ${T.perf.rangeNm.toLocaleString('en-US')} nm` : '';
+    return `<div class="accard">${th ? `<img class="acthumb" src="${th}" alt="">` : ''}<div class="acspec"><b>${esc(t.name || (T && T.name) || id)}</b><span>${spec}</span>${extra || ''}</div></div>`;
+  }
+  function fleetBox(ui, el, car) {
+    const S = C.typeStatus(car), busy = C.tripBusy(car), seg = h('div', { class: 'seg small' });
+    for (const t of S) if (t.held && t.flyable) seg.append(h('button', { class: t.current ? 'on' : '', title: t.name, onclick: () => {
+      const r = C.selectType(car, t.id); if (r === 'busy') ui.toast('Finish today’s trip first: the rest of it is scheduled on the ' + (C.TYPE_RATINGS.find((x) => x.id === car.type) || {}).name + '.', 'warn', 5000);
+      else if (r) ui.toast(`Flying the ${t.name}: crew scheduling rebuilt today's trip`, 'good'); ui._menu(); } }, t.name.replace(/^(Boeing|Airbus|Embraer|Bombardier) /, '')));
+    const other = S.filter((t) => !t.held && t.flyable);
+    el.innerHTML = acCard(car.type, `<span class="acnote">Pay ×${(C.TYPE_RATINGS.find((x) => x.id === car.type) || { pay: 1 }).pay.toFixed(2)} on this type${busy ? ' · today’s trip is under way: you can change aircraft before your next trip' : ''}</span>`);
+    el.prepend(h('div', { class: 'acg' }, h('b', {}, 'Rated'), seg));
+    if (other.length) el.append(h('div', { class: 'desc', html: 'Type courses: ' + other.map((t) => `<b>${esc(t.name)}</b> ${t.eligible ? '(eligible now)' : '(needs ' + esc(t.why.join(', ')) + ')'}`).join(' · ') + ' · <a href="#" class="tcl" style="color:inherit;text-decoration:underline">Bids &amp; airlines →</a>' }));
+    const l = $('.tcl', el); if (l) l.onclick = (e) => { e.preventDefault(); ui.cfg.jobSub = 'bids'; ui._menu(); };
   }
   function nextUpgradeBox(el, car, compact) {
     const n = C.nextUpgrade(car);
@@ -12877,7 +12903,7 @@ void main(){
     $('.bi', sb).onchange = (e) => { C.setBid(car, Object.assign({}, car.bid, { intl: e.target.checked })); };
     const bs = $('.bases', sb); for (const b of C.AL[car.airline].bases) bs.append(h('button', { class: car.base === b ? 'on' : '', onclick: () => { if (b === car.base) return; if (C.changeBase(car, b)) { ui.toast(`Base transfer awarded: ${city(b)}`, 'good'); } else ui.toast('Not senior enough for a base transfer yet', 'warn'); ui._menu(); } }, city(b)));
     const ty = $('.types', sb);
-    for (const t of C.typeStatus(car)) ty.append(h('div', { class: 'trow' + (t.current ? ' on' : ''), html: `<b>${t.name}</b><small>${t.cls} · pay ×${t.pay.toFixed(2)}</small><span>${t.current ? 'flying now' : !t.flyable ? 'not yet flyable' : t.held ? '' : t.eligible ? '' : 'needs ' + t.why.join(', ')}</span>` }, ...(t.flyable && !t.current && (t.held || t.eligible) ? [h('button', { class: 'btn small', onclick: () => { C.trainType(car, t.id); ui._menu(); } }, t.held ? 'Bid this fleet' : 'Type course')] : [])));
+    for (const t of C.typeStatus(car)) ty.append(h('div', { class: 'trow' + (t.current ? ' on' : ''), html: `<b>${t.name}</b><small>${t.cls} · pay ×${t.pay.toFixed(2)}</small><span>${t.current ? 'flying now' : !t.flyable ? 'not yet flyable' : t.held ? '' : t.eligible ? '' : 'needs ' + t.why.join(', ')}</span>` }, ...(t.flyable && !t.current && (t.held || t.eligible) ? [h('button', { class: 'btn small', onclick: () => { if (C.trainType(car, t.id) === 'busy') ui.toast('Finish today’s trip first: a fleet change starts with a new trip.', 'warn', 5000); ui._menu(); } }, t.held ? 'Bid this fleet' : 'Type course')] : [])));
     const al = $('.alist', sb);
     for (const k in C.AL) {
       if (k === car.airline) continue; const a = C.AL[k], j = C.canJoin(car, k), L = LIV(k);
@@ -12890,16 +12916,20 @@ void main(){
     const c = ui.cfg, tier0 = Object.keys(C.AL).filter((k) => C.AL[k].tier === 0);
     if (!C.AL[c.hireAirline] || C.AL[c.hireAirline].tier !== 0) c.hireAirline = tier0.indexOf(c.airline) >= 0 ? c.airline : tier0[0];
     const al = C.AL[c.hireAirline], bases = al.bases; if (bases.indexOf(c.hireBase) < 0) c.hireBase = bases[0];
-    body.innerHTML = `<div class="grid"><section class="span2"><h3>Job offers</h3><p class="desc">You start as a new-hire First Officer on the Boeing 737-800. Crew scheduling builds your day trips (2–4 legs, 4 days on and 3 off) at real local times within FAR 117 duty limits; you fly each leg, then continue to the next or clock off. Pay follows your rank and block hours; reputation follows your landings, on-time performance, passenger comfort and safety. Major and international airlines (${Object.keys(C.AL).filter((k) => C.AL[k].tier > 0).map((k) => C.AL[k].name).join(', ')}) hire experienced pilots later.</p></section>
+    body.innerHTML = `<div class="grid"><section class="span2"><h3>Job offers</h3><p class="desc">You start as a new-hire First Officer on one of the airline's entry fleets. Crew scheduling builds your day trips (2–4 legs, 4 days on and 3 off) at real local times within FAR 117 duty limits; you fly each leg, then continue to the next or clock off. Pay follows your rank and block hours; reputation follows your landings, on-time performance, passenger comfort and safety. Major and international airlines (${Object.keys(C.AL).filter((k) => C.AL[k].tier > 0).map((k) => C.AL[k].name).join(', ')}) hire experienced pilots later.</p></section>
       <section><h3>Your name</h3><input class="pname" maxlength="24" placeholder="Your name" value="${esc(ui.profile.name || '')}"/></section>
       <section><h3>Airline</h3><div class="airlines"></div></section>
+      <section class="span2"><h3>Aircraft</h3><div class="hac"></div><div class="desc">New hires train on an entry fleet. Larger types (A320 family, 757, widebodies) open up with block hours and reputation through type courses.</div></section>
       <section class="span2"><h3>Crew base</h3><div class="seg bases"></div><div class="desc">${al.hubs ? 'Hub-and-spoke: most trips go out and back through the hubs.' : 'Point-to-point network: trips can hop between several cities before heading home.'} You start with <b>regional</b> route authority (airports within 700 nm of your base); the rest of the network opens up as you gain experience.</div></section></div>
       <div class="actions"><button class="btn primary hire">Accept the job offer</button></div>`;
     const ael = $('.airlines', body);
     for (const k of tier0) { const l = LIV(k); ael.append(h('button', { class: 'airline' + (c.hireAirline === k ? ' on' : ''), onclick: () => { c.hireAirline = k; c.airline = k; ui._menu(); }, html: `<span class="sw" style="background:linear-gradient(180deg, ${l.top} 0 ${Math.round(l.split * 100)}%, ${l.belly} ${Math.round(l.split * 100)}% 100%)"><i style="background:${l.tail[0]}"></i></span><b>${l.name}</b>` })); }
     const bs = $('.bases', body); for (const b of bases) bs.append(h('button', { class: c.hireBase === b ? 'on' : '', onclick: () => { c.hireBase = b; ui._menu(); } }, city(b)));
+    const ent = C.entryTypes(c.hireAirline); if (ent.indexOf(c.hireType) < 0) c.hireType = ent[0];
+    const ha = $('.hac', body), hs = h('div', { class: 'seg small' }); for (const id of ent) hs.append(h('button', { class: c.hireType === id ? 'on' : '', onclick: () => { c.hireType = id; ui._menu(); } }, (C.TYPE_RATINGS.find((x) => x.id === id) || { name: id }).name));
+    ha.innerHTML = acCard(c.hireType); ha.prepend(hs);
     const nm = $('.pname', body); nm.onkeydown = (e) => e.stopPropagation();
-    $('.hire', body).onclick = () => { ui.profile.name = nm.value.trim(); try { localStorage.setItem('linepilot.profile', JSON.stringify(ui.profile)); } catch (e) { } C.hire(c.hireAirline, c.hireBase, ui.profile.name); c.jobSub = 'today'; ui._menu(); };
+    $('.hire', body).onclick = () => { ui.profile.name = nm.value.trim(); try { localStorage.setItem('linepilot.profile', JSON.stringify(ui.profile)); } catch (e) { } C.hire(c.hireAirline, c.hireBase, ui.profile.name, c.hireType); c.jobSub = 'today'; ui._menu(); };
   }
 
   // ------------------------------------------------------------ dispatch: decisions before a leg, then launch
