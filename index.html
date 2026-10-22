@@ -4461,6 +4461,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
     return [Math.min(h, 400), Math.min(mh, h - 1)];
   }
   function colorOf(tags, rnd) {
+    if (tags._masonry) { const B = [[0.62, 0.38, 0.3], [0.7, 0.5, 0.38], [0.78, 0.68, 0.55], [0.55, 0.33, 0.27], [0.84, 0.78, 0.66], [0.66, 0.6, 0.52], [0.48, 0.3, 0.25]]; return B[Math.floor(rnd * B.length)]; }
     const c = tags['building:colour'] || tags['building:color'];
     if (c && /^#?[0-9a-f]{6}$/i.test(c)) { const s = c.replace('#', ''); return [parseInt(s.substr(0, 2), 16) / 255, parseInt(s.substr(2, 2), 16) / 255, parseInt(s.substr(4, 2), 16) / 255]; }
     const named = { white: [0.9, 0.9, 0.88], grey: [0.6, 0.6, 0.6], gray: [0.6, 0.6, 0.6], gold: [0.85, 0.7, 0.35], brown: [0.55, 0.42, 0.32], beige: [0.85, 0.78, 0.65], blue: [0.4, 0.55, 0.7], black: [0.2, 0.2, 0.22] };
@@ -4476,6 +4477,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
   // facade materials: [texture key, metres covered by one texture repeat horizontally, vertically]
   const MATS = { punch: ['punch', 24, 28], glass: ['glass', 12, 14], metal: ['metal', 8, 8], park: ['park', 24, 12] };
   function matOf(tags, h) {
+    if (tags._masonry) return 'punch';
     const a = tags.aeroway || '', b = tags.building || '';
     if (a === 'hangar' || b === 'hangar' || b === 'industrial' || b === 'warehouse' || b === 'shed' || b === 'roof') return 'metal';
     if (b === 'parking' || tags.parking === 'multi-storey') return 'park';
@@ -4486,7 +4488,7 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
   function inPoly(pts, x, z) { let c = false; for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) { const a = pts[i], b = pts[j]; if ((a[1] > z) !== (b[1] > z) && x < (b[0] - a[0]) * (z - a[1]) / (b[1] - a[1]) + a[0]) c = !c; } return c; }
 
   class Buildings {
-    constructor(r) { this.r = r; this.chunks = []; this.status = 'not loaded'; this.count = 0; this._tok = 0; this.tex = this._textures(); }
+    constructor(r, sharedTex) { this.r = r; this.chunks = []; this.status = 'not loaded'; this.count = 0; this._tok = 0; this.tex = sharedTex || this._textures(); }
     // procedural facade / roof textures (white-based where the wall colour should tint them); *Lit = night window masks
     _textures() {
       const mk = (w, h, fn, opts) => { const c = document.createElement('canvas'); c.width = w; c.height = h; const x = c.getContext('2d'); fn(x, w, h); return this.r.texFromImage(c, Object.assign({ repeat: true }, opts || {})); };
@@ -4604,6 +4606,8 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
         let cx = 0, cz = 0; for (const p of pts) { cx += p[0]; cz += p[1]; } cx /= pts.length; cz /= pts.length;
         const ap = nearestApt(cx, cz);
         const [h, mh] = heightOf(tags, !!ap);
+        if (!ap && !this.isNYC && window.NYCCity && NYCCity._inst && NYCCity._inst.covers(cx, cz)) return;   // NYC Open Data has this block
+        if (!ap && window.Landmarks && Landmarks._inst && Landmarks._inst.suppress(cx, cz, h, tags)) return;   // NYC: our landmark replaces it / built after 2001
         // base: airport plane, else lowest terrain under the footprint
         let base = Infinity;
         if (ap) base = planeH(ap, cx, cz);
@@ -4721,8 +4725,558 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
 })();
 
 </script>
-<script>/* ==== worldgen.js ==== */
-// ===== worldgen.js : built-in "synthetic satellite" world used when real imagery can't be downloaded =====
+
+<script>/* ==== landmarks.js ==== */// ===== landmarks.js : hand-built New York City landmarks, incl. the 1990s skyline with the original World Trade Center =====
+// Always available (no download needed). Setting "New York skyline": '1990s' (default: Twin Towers, old 7 WTC, no
+// post-2001 towers) or 'today'. In 1990s mode, OpenStreetMap buildings that did not exist before 2001 are hidden.
+(function () {
+  'use strict';
+  const { toXZ } = Geo;
+  const D2R = Math.PI / 180;
+  const NYC = [40.735, -73.99];
+  const GRID = 29;    // Manhattan street grid bearing (degrees east of north)
+
+  // ---------------------------------------------------------------- facade textures
+  function canvas(w, h, fn) { const c = document.createElement('canvas'); c.width = w; c.height = h; fn(c.getContext('2d'), w, h); return c; }
+  let seed = 7; const R = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+  function litMask(w, h, cols, rows, rect, density) {   // night window pattern matching a facade grid
+    return canvas(w, h, (x) => {
+      x.fillStyle = '#000'; x.fillRect(0, 0, w, h);
+      const cw = w / cols, rh = h / rows;
+      for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+        if (R() > density) continue;
+        const v = 0.5 + R() * 0.5, t = R(), c = t < 0.6 ? [255, 214, 150] : t < 0.85 ? [255, 238, 205] : [210, 228, 255];
+        x.fillStyle = `rgb(${c[0] * v | 0},${c[1] * v | 0},${c[2] * v | 0})`;
+        x.fillRect(i * cw + rect[0] * cw, (rows - 1 - j) * rh + rect[1] * rh, rect[2] * cw, rect[3] * rh);
+      }
+    });
+  }
+  function textures(r) {
+    const T = (c) => r.texFromImage(c, { repeat: true });
+    const out = {};
+    // --- World Trade Center towers: 59 narrow aluminium columns per face, 18-inch windows. One repeat = 8 columns
+    // (8.16 m) x 2 floors (7.32 m). Columns are light silver, the windows a dark slot.
+    out.wtc = T(canvas(256, 256, (x, w, h) => {
+      x.fillStyle = '#c9ced4'; x.fillRect(0, 0, w, h);
+      for (let i = 0; i < 8; i++) {
+        const X = i * 32;
+        const g = x.createLinearGradient(X, 0, X + 32, 0); g.addColorStop(0, '#aeb4bb'); g.addColorStop(0.35, '#eef1f4'); g.addColorStop(0.55, '#dfe3e8'); g.addColorStop(1, '#a3a9b0');
+        x.fillStyle = g; x.fillRect(X, 0, 18, h);                                     // column cover (55 %)
+        for (let f = 0; f < 2; f++) {
+          const Y = f * 128;
+          const gw = x.createLinearGradient(0, Y, 0, Y + 128); gw.addColorStop(0, '#1d252e'); gw.addColorStop(0.6, '#3a4754'); gw.addColorStop(1, '#2a343f');
+          x.fillStyle = gw; x.fillRect(X + 18, Y + 6, 14, 92);                          // window slot
+          x.fillStyle = '#8f969e'; x.fillRect(X + 18, Y + 98, 14, 30);                  // spandrel
+          if (R() < 0.3) { x.fillStyle = 'rgba(230,226,214,0.55)'; x.fillRect(X + 18, Y + 6, 14, 20 + R() * 50); }   // blinds
+        }
+      }
+    }));
+    out.wtcLit = T(litMask(256, 256, 8, 2, [18 / 32, 6 / 128, 14 / 32, 92 / 128], 0.55));
+    // mechanical floors (louvres instead of glass): darker band
+    out.louvre = T(canvas(256, 64, (x, w, h) => {
+      x.fillStyle = '#7d848c'; x.fillRect(0, 0, w, h);
+      for (let i = 0; i < 8; i++) { x.fillStyle = '#d6dade'; x.fillRect(i * 32, 0, 18, h); x.fillStyle = '#4a525b'; for (let y = 2; y < h; y += 6) x.fillRect(i * 32 + 18, y, 14, 3); }
+    }));
+    // plaza-level lobby: tall pointed "trident" arches, one per 3 columns (3.06 m bay x 22 m)
+    out.lobby = T(canvas(64, 448, (x, w, h) => {
+      x.fillStyle = '#dfe3e7'; x.fillRect(0, 0, w, h);
+      const gw = x.createLinearGradient(0, 0, 0, h); gw.addColorStop(0, '#22303c'); gw.addColorStop(1, '#5e7384');
+      x.fillStyle = gw; x.beginPath(); x.moveTo(8, h); x.lineTo(8, 150); x.quadraticCurveTo(8, 60, 32, 20); x.quadraticCurveTo(56, 60, 56, 150); x.lineTo(56, h); x.closePath(); x.fill();
+      x.fillStyle = '#c7ccd2'; x.fillRect(30, 40, 4, h - 40); for (let y = 160; y < h; y += 70) x.fillRect(8, y, 48, 3);
+    }));
+    out.lobbyLit = T(canvas(64, 448, (x, w, h) => { x.fillStyle = '#000'; x.fillRect(0, 0, w, h); x.fillStyle = '#d9c39a'; x.beginPath(); x.moveTo(8, h); x.lineTo(8, 150); x.quadraticCurveTo(8, 60, 32, 20); x.quadraticCurveTo(56, 60, 56, 150); x.lineTo(56, h); x.closePath(); x.fill(); }));
+    // generic facades: [base colour, window colour, columns, rows, window rect (fractions of a cell), repeat metres]
+    const fac = (base, win, cols, rows, rect, noise) => canvas(256, 256, (x, w, h) => {
+      x.fillStyle = base; x.fillRect(0, 0, w, h);
+      for (let i = 0; i < 2500; i++) { x.fillStyle = `rgba(${R() < 0.5 ? 0 : 255},${R() < 0.5 ? 0 : 255},${R() < 0.5 ? 0 : 255},${(noise || 0.04) * R()})`; x.fillRect(R() * w, R() * h, 3, 3); }
+      const cw = w / cols, rh = h / rows;
+      for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+        const X = i * cw + rect[0] * cw, Y = j * rh + rect[1] * rh, W = rect[2] * cw, H = rect[3] * rh;
+        const g = x.createLinearGradient(0, Y, 0, Y + H); g.addColorStop(0, win[0]); g.addColorStop(1, win[1]); x.fillStyle = g; x.fillRect(X, Y, W, H);
+        x.fillStyle = 'rgba(255,255,255,0.12)'; x.fillRect(X + 1, Y + 1, Math.max(1, W * 0.2), H - 2);
+      }
+    });
+    const G = (name, base, win, cols, rows, rect, dens) => { out[name] = T(fac(base, win, cols, rows, rect)); out[name + 'Lit'] = T(litMask(256, 256, cols, rows, rect, dens)); };
+    G('deco', '#d9ceb6', ['#2a2f36', '#4a525c'], 6, 6, [0.32, 0.18, 0.36, 0.62], 0.4);     // limestone + vertical window strips (Empire State, 30 Rock)
+    G('brick', '#e7e3da', ['#23272d', '#3d444d'], 8, 6, [0.2, 0.3, 0.6, 0.45], 0.4);       // white brick (Chrysler)
+    G('granite', '#7d4334', ['#1f2328', '#3a4148'], 8, 8, [0.06, 0.25, 0.88, 0.5], 0.45);   // red granite, ribbon windows (old 7 WTC)
+    G('silver', '#cfd3d8', ['#26323e', '#475a6b'], 4, 8, [0, 0.45, 1, 0.5], 0.5);          // aluminium bands + strip glass (Citicorp)
+    G('precast', '#bdb9b1', ['#2b3036', '#48505a'], 8, 8, [0.18, 0.22, 0.64, 0.56], 0.45);   // precast concrete grid (MetLife, 40 Wall)
+    G('gothic', '#ece5d3', ['#2d3036', '#4f555d'], 6, 6, [0.25, 0.15, 0.5, 0.7], 0.35);     // terracotta (Woolworth)
+    G('bronze', '#4c4036', ['#1a1d21', '#32383e'], 8, 4, [0.55, 0.05, 0.4, 0.75], 0.4);    // low WTC buildings (dark bronze pinstripe)
+    G('stone', '#b8ad98', ['#7b705d', '#8a7f6b'], 4, 4, [0.0, 0.48, 1, 0.04], 0.0);        // granite blocks (bridge towers, pedestal)
+    return out;
+  }
+  // material -> [texture, metres per repeat (horizontal), metres per repeat (vertical), spec, gloss]
+  const MAT = {
+    wtc: ['wtc', 8.16, 7.32, 0.55, 0.45], louvre: ['louvre', 8.16, 7.32, 0.3, 0.2], lobby: ['lobby', 3.06, 22, 0.4, 0.3],
+    deco: ['deco', 18, 21, 0.12, 0], brick: ['brick', 24, 22, 0.15, 0], granite: ['granite', 20, 28, 0.3, 0.2], silver: ['silver', 12, 28, 0.5, 0.4],
+    precast: ['precast', 24, 28, 0.12, 0], gothic: ['gothic', 18, 22, 0.12, 0], bronze: ['bronze', 16, 14, 0.35, 0.2], stone: ['stone', 6, 6, 0.05, 0],
+    plain: [null, 1, 1, 0.2, 0], metal: [null, 1, 1, 0.8, 0.6], glow: [null, 1, 1, 0, 0],
+  };
+
+  // ---------------------------------------------------------------- geometry helpers (local metres around a centre)
+  // bearing deg -> unit vector in (x east, z south)
+  const dirOf = (b) => [Math.sin(b * D2R), -Math.cos(b * D2R)];
+  class Kit {
+    constructor() { this.g = {}; }
+    geo(m) { return this.g[m] || (this.g[m] = new Eng.Geo()); }
+    // vertical wall from a to b (x,z) between y0 and y1, normal facing away from (cx, cz)
+    wall(m, a, b, y0, y1, col, cx, cz, uOff, vOff) {
+      const mid = [(a[0] + b[0]) / 2 - cx, (a[1] + b[1]) / 2 - cz], n = [-(b[1] - a[1]), b[0] - a[0]];
+      if (n[0] * mid[0] + n[1] * mid[1] < 0) { const t = a; a = b; b = t; }
+      const [, TW, TH] = MAT[m], L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      const u0 = (uOff || 0) / TW, u1 = u0 + L / TW, v0 = (vOff || 0) / TH, v1 = v0 + (y1 - y0) / TH;
+      this.geo(m).fquad([a[0], y0, a[1]], [b[0], y0, b[1]], [b[0], y1, b[1]], [a[0], y1, a[1]], col, [[u0, v0], [u1, v0], [u1, v1], [u0, v1]]);
+    }
+    // horizontal polygon (convex) at height y, facing up (or down)
+    cap(m, pts, y, col, down) {
+      const g = this.geo(m), n = down ? [0, -1, 0] : [0, 1, 0], b = g.vcount;
+      for (const p of pts) g.vert([p[0], y, p[1]], n, col, [p[0] / 8, p[1] / 8]);
+      // orient: signed area in (x,z)
+      let s = 0; for (let i = 0; i < pts.length; i++) { const p = pts[i], q = pts[(i + 1) % pts.length]; s += p[0] * q[1] - q[0] * p[1]; }
+      const flip = (s > 0) !== !!down;   // z south: positive area = clockwise seen from above
+      for (let i = 1; i < pts.length - 1; i++) flip ? g.tri(b, b + i + 1, b + i) : g.tri(b, b + i, b + i + 1);
+    }
+    // rectangle footprint centred at (x, z), w along bearing `rot`+90 (cross), d along `rot`; optional corner bevel
+    rect(x, z, w, d, rot, bevel) {
+      const f = dirOf(rot), s = dirOf(rot + 90), hw = w / 2, hd = d / 2, e = bevel || 0;
+      const P = (a, b) => [x + s[0] * a + f[0] * b, z + s[1] * a + f[1] * b];
+      if (!e) return [P(-hw, -hd), P(hw, -hd), P(hw, hd), P(-hw, hd)];
+      return [P(-hw + e, -hd), P(hw - e, -hd), P(hw, -hd + e), P(hw, hd - e), P(hw - e, hd), P(-hw + e, hd), P(-hw, hd - e), P(-hw, -hd + e)];
+    }
+    // extruded prism with walls of material m and a roof of colour rc (material 'plain')
+    prism(m, pts, y0, y1, col, rc, vBase) {
+      let cx = 0, cz = 0; for (const p of pts) { cx += p[0]; cz += p[1]; } cx /= pts.length; cz /= pts.length;
+      let run = 0;
+      for (let i = 0; i < pts.length; i++) { const a = pts[i], b = pts[(i + 1) % pts.length]; this.wall(m, a, b, y0, y1, col, cx, cz, run, y0 - (vBase ?? y0)); run += Math.hypot(b[0] - a[0], b[1] - a[1]); }
+      if (rc) this.cap('plain', pts, y1, rc);
+    }
+    tier(m, x, z, w, d, rot, y0, y1, col, rc, bevel, vBase) { this.prism(m, this.rect(x, z, w, d, rot, bevel), y0, y1, col, rc, vBase); }
+    // pyramid / hip roof from a footprint up to an apex height
+    pyramid(m, pts, y0, y1, col, apex) {
+      let cx = 0, cz = 0; for (const p of pts) { cx += p[0]; cz += p[1]; } cx /= pts.length; cz /= pts.length;
+      const A = apex || [cx, cz], g = this.geo(m);
+      for (let i = 0; i < pts.length; i++) {
+        let a = pts[i], b = pts[(i + 1) % pts.length];
+        const mid = [(a[0] + b[0]) / 2 - cx, (a[1] + b[1]) / 2 - cz], n = [-(b[1] - a[1]), b[0] - a[0]];
+        if (n[0] * mid[0] + n[1] * mid[1] < 0) { const t = a; a = b; b = t; }
+        g.ftri([a[0], y0, a[1]], [b[0], y0, b[1]], [A[0], y1, A[1]], col);
+      }
+    }
+    spire(m, x, z, y0, y1, r0, r1, seg, col) { this.geo(m).cyl([x, y0, z], [x, y1, z], r0, r1, seg || 6, col, true); }
+    box(m, x, y, z, sx, sy, sz, rot, col) { this.geo(m).box([x, y, z], [sx, sy, sz], col, Eng.Q.axisAngle([0, 1, 0], -rot * D2R)); }
+    build(r) { const out = {}; for (const k in this.g) if (this.g[k].vcount) out[k] = this.g[k].build(r); return out; }
+  }
+
+  // ---------------------------------------------------------------- the landmarks
+  // Each builder gets a Kit and works in metres around the landmark's own (lat, lon); y is metres above sea level.
+  const SILVER = [0.93, 0.94, 0.96], WHITE = [1, 1, 1];
+  function twinTower(K, x, z, base, roof, north) {
+    const W = 63.4, BEV = 2.2, rot = GRID;
+    const fp = K.rect(x, z, W, W, rot, BEV);
+    K.prism('lobby', fp, base - 20, base + 22, WHITE, null, base);
+    // facade bands: offices with darker mechanical floors (louvres) at 7-8, 41-42, 75-76, 108-109
+    const fl = (n) => base + n * 3.66;
+    const bands = [[base + 22, fl(7)], [fl(7), fl(9), 'louvre'], [fl(9), fl(41)], [fl(41), fl(43), 'louvre'], [fl(43), fl(75)], [fl(75), fl(77), 'louvre'], [fl(77), fl(107)], [fl(107), roof, 'louvre']];
+    for (const [a, b, m] of bands) K.prism(m || 'wtc', fp, a, b, SILVER, null, base);
+    K.cap('plain', fp, roof, [0.42, 0.43, 0.45]);
+    K.prism('plain', K.rect(x, z, W - 1, W - 1, rot, BEV), roof, roof + 1.2, [0.72, 0.74, 0.77], [0.4, 0.41, 0.43]);   // parapet
+    const f = dirOf(rot), s = dirOf(rot + 90);
+    if (north) {
+      // 110 m television mast (1978) on its square base, with platform rings; red obstruction lights at night
+      K.tier('plain', x, z, 16, 16, rot, roof, roof + 7, [0.62, 0.63, 0.65], [0.5, 0.5, 0.52]);
+      K.spire('metal', x, z, roof + 7, roof + 72, 3.4, 1.6, 6, [0.86, 0.87, 0.88]);
+      K.spire('metal', x, z, roof + 72, roof + 108, 1.6, 0.45, 6, [0.9, 0.9, 0.9]);
+      for (const h of [28, 52, 72]) K.spire('metal', x, z, roof + h, roof + h + 1.2, 4.2, 4.2, 8, [0.8, 0.8, 0.82]);
+      for (const h of [40, 74, 108]) K.box('glow', x, roof + h, z, 1.4, 1.4, 1.4, rot, [1, 0.12, 0.08]);
+      // rooftop window-washing machine tracks / mechanical
+      for (const k of [-1, 1]) K.box('plain', x + s[0] * k * 20, roof + 2, z + s[1] * k * 20, 6, 3, 24, rot, [0.55, 0.56, 0.58]);
+    } else {
+      // Top of the World outdoor observation deck: raised walkway set back from the edge
+      K.prism('plain', K.rect(x, z, 44, 44, rot, 2), roof, roof + 4, [0.6, 0.62, 0.64], null);
+      K.prism('plain', K.rect(x, z, 40, 40, rot, 2), roof, roof + 4, [0.6, 0.62, 0.64], [0.52, 0.53, 0.55]);
+      K.tier('plain', x + f[0] * 6, z + f[1] * 6, 18, 10, rot, roof, roof + 6, [0.68, 0.69, 0.7], [0.5, 0.5, 0.52]);
+      for (const k of [-1, 1]) K.box('glow', x + s[0] * k * 30, roof + 2, z + s[1] * k * 30, 0.8, 0.8, 0.8, rot, [1, 0.12, 0.08]);
+    }
+  }
+  // site frame for the World Trade Center: centre between the towers, axes along the street grid
+  const WTC_N = [40.712083, -74.013139], WTC_S = [40.710944, -74.013056];
+  const LANDMARKS = [
+    { id: 'wtc', name: 'World Trade Center (1973–2001)', era: '1990s', ll: [(WTC_N[0] + WTC_S[0]) / 2, (WTC_N[1] + WTC_S[1]) / 2], r: 330, base: 4,
+      build(K, P, b) {
+        const n = P(WTC_N), s = P(WTC_S);
+        twinTower(K, n[0], n[1], b, b + 417, true);       // 1 WTC, North Tower: 417 m roof, 527 m to the mast tip
+        twinTower(K, s[0], s[1], b, b + 415, false);      // 2 WTC, South Tower: 415 m roof
+        const at = (u, v) => { const f = dirOf(GRID), sd = dirOf(GRID + 90); return [f[0] * u + sd[0] * v, f[1] * u + sd[1] * v]; };
+        const low = (u, v, w, d, h, m, col) => { const p = at(u, v); K.tier(m, p[0], p[1], w, d, GRID, b - 20, b + h, col, [0.36, 0.36, 0.37], 0, b); };
+        low(118, -55, 95, 70, 34, 'bronze', WHITE);      // 6 WTC (US Customs House), north-west
+        low(112, 62, 105, 62, 37, 'bronze', WHITE);      // 5 WTC, north-east
+        low(-112, 62, 105, 62, 37, 'bronze', WHITE);     // 4 WTC, south-east
+        low(-8, -82, 34, 60, 76, 'precast', [0.92, 0.9, 0.88]);   // 3 WTC, Marriott hotel, between the towers on the west side
+        // Austin J. Tobin Plaza with Fritz Koenig's bronze Sphere
+        const pz = at(0, 18); K.cap('plain', K.rect(pz[0], pz[1], 120, 190, GRID), b + 0.3, [0.66, 0.64, 0.6]);
+        const sp = at(-5, 30); K.geo('metal').sphere([sp[0], b + 7, sp[1]], 3.8, [0.55, 0.45, 0.28], 8);
+        K.spire('stone', sp[0], sp[1], b, b + 3, 6, 6, 12, [0.7, 0.68, 0.64]);
+        // old 7 WTC (1987): 186 m, red granite, across Vesey Street
+        const p7 = at(222, -18); K.tier('granite', p7[0], p7[1], 100, 46, GRID, b - 20, b + 186, WHITE, [0.32, 0.3, 0.3], 0, b);
+        K.tier('plain', p7[0], p7[1], 60, 30, GRID, b + 186, b + 191, [0.4, 0.38, 0.37], [0.3, 0.3, 0.3]);
+      } },
+    { id: 'esb', name: 'Empire State Building', era: 'both', ll: [40.748441, -73.985664], r: 80, base: 15,
+      build(K, P, b) {
+        const t = [[0, 25, 60, 128], [25, 83, 52, 104], [83, 110, 46, 84], [110, 262, 40, 58], [262, 305, 34, 46], [305, 318, 26, 30], [318, 330, 18, 18]];
+        for (const [y0, y1, w, d] of t) K.tier('deco', 0, 0, d, w, GRID, b + (y0 ? y0 : -20), b + y1, WHITE, [0.68, 0.65, 0.58], 0, b);
+        K.spire('metal', 0, 0, b + 330, b + 360, 8, 6.5, 8, [0.86, 0.85, 0.82]);           // mooring mast
+        K.spire('metal', 0, 0, b + 360, b + 381, 6.5, 3.2, 8, [0.9, 0.9, 0.88]);
+        K.spire('metal', 0, 0, b + 381, b + 443, 1.6, 0.3, 6, [0.85, 0.85, 0.86]);         // antenna
+        K.box('glow', 0, b + 443, 0, 1, 1, 1, 0, [1, 0.12, 0.08]);
+      } },
+    { id: 'chrysler', name: 'Chrysler Building', era: 'both', ll: [40.751652, -73.975311], r: 50, base: 12,
+      build(K, P, b) {
+        K.tier('brick', 0, 0, 60, 62, GRID, b - 20, b + 62, WHITE, [0.5, 0.5, 0.52], 0, b);
+        K.tier('brick', 0, 0, 46, 46, GRID, b + 62, b + 95, WHITE, [0.5, 0.5, 0.52], 0, b);
+        K.tier('brick', 0, 0, 36, 36, GRID, b + 95, b + 242, WHITE, null, 0, b);
+        // terraced stainless-steel crown: shrinking stages with sunburst arches, then the needle spire
+        let w = 36, y = b + 242;
+        for (let i = 0; i < 6; i++) { const h = 7 - i * 0.6; K.tier('metal', 0, 0, w, w, GRID, y, y + h, [0.92, 0.93, 0.95], null, w * 0.18); K.pyramid('metal', K.rect(0, 0, w, w, GRID, w * 0.18), y + h, y + h + 3, [0.95, 0.96, 0.98]); y += h; w *= 0.8; }
+        K.spire('metal', 0, 0, y, b + 319, w * 0.5, 0.15, 8, [0.96, 0.97, 0.99]);
+      } },
+    { id: 'wall40', name: '40 Wall Street', era: 'both', ll: [40.70694, -74.00913], r: 45, base: 8,
+      build(K, P, b) {
+        K.tier('precast', 0, 0, 40, 56, 27, b - 20, b + 110, [0.95, 0.92, 0.86], [0.5, 0.5, 0.5], 0, b);
+        K.tier('precast', 0, 0, 30, 30, 27, b + 110, b + 245, [0.95, 0.92, 0.86], null, 0, b);
+        K.pyramid('plain', K.rect(0, 0, 30, 30, 27), b + 245, b + 272, [0.32, 0.55, 0.5]);   // green copper pyramid
+        K.spire('metal', 0, 0, b + 272, b + 283, 0.9, 0.1, 6, [0.8, 0.8, 0.82]);
+      } },
+    { id: 'pine70', name: '70 Pine Street', era: 'both', ll: [40.706389, -74.007778], r: 40, base: 8,
+      build(K, P, b) {
+        K.tier('deco', 0, 0, 40, 46, 27, b - 20, b + 90, [0.9, 0.88, 0.85], [0.5, 0.5, 0.5], 0, b);
+        K.tier('deco', 0, 0, 30, 30, 27, b + 90, b + 230, [0.9, 0.88, 0.85], null, 0, b);
+        K.tier('deco', 0, 0, 20, 20, 27, b + 230, b + 252, [0.9, 0.88, 0.85], null, 0, b);
+        K.pyramid('metal', K.rect(0, 0, 20, 20, 27), b + 252, b + 262, [0.75, 0.82, 0.86]);
+        K.spire('metal', 0, 0, b + 262, b + 290, 1.2, 0.1, 6, [0.85, 0.85, 0.86]);
+      } },
+    { id: 'woolworth', name: 'Woolworth Building', era: 'both', ll: [40.712361, -74.008194], r: 55, base: 8,
+      build(K, P, b) {
+        K.tier('gothic', 0, 0, 60, 46, 27, b - 20, b + 100, WHITE, [0.45, 0.45, 0.46], 0, b);
+        K.tier('gothic', 0, 0, 27, 27, 27, b + 100, b + 180, WHITE, null, 3, b);
+        K.tier('gothic', 0, 0, 22, 22, 27, b + 180, b + 205, WHITE, null, 3, b);
+        K.pyramid('plain', K.rect(0, 0, 22, 22, 27, 3), b + 205, b + 236, [0.36, 0.56, 0.5]);
+        K.spire('metal', 0, 0, b + 236, b + 241, 0.8, 0.1, 6, [0.8, 0.72, 0.4]);
+      } },
+    { id: 'citicorp', name: 'Citicorp Center', era: 'both', ll: [40.758333, -73.970278], r: 45, base: 20,
+      build(K, P, b) {
+        // four mid-side stilts + central core, then the silver tower with its 45° south-facing roof
+        const f = dirOf(GRID), s = dirOf(GRID + 90);
+        for (const [u, v] of [[22, 0], [-22, 0], [0, 22], [0, -22], [0, 0]]) K.tier('plain', f[0] * u + s[0] * v, f[1] * u + s[1] * v, u || v ? 7 : 16, u || v ? 7 : 16, GRID, b - 20, b + 35, [0.82, 0.82, 0.8], null);
+        K.tier('silver', 0, 0, 48, 48, GRID, b + 35, b + 236, WHITE, null, 0, b);
+        const fp = K.rect(0, 0, 48, 48, GRID), top = b + 236, peak = b + 279;
+        // slanted roof: north edge high, south edge low (pts 2,3 are the "north" side along +f)
+        const g = K.geo('silver'), up = (p, y) => [p[0], y, p[1]];
+        g.fquad(up(fp[0], top), up(fp[1], top), up(fp[2], peak), up(fp[3], peak), [0.9, 0.92, 0.94]);
+        K.wall('silver', fp[1], fp[2], top, peak, WHITE, 0, 0); K.wall('silver', fp[3], fp[0], top, peak, WHITE, 0, 0);
+        g.ftri(up(fp[0], top), up(fp[3], peak), up(fp[3], top), WHITE); g.ftri(up(fp[1], top), up(fp[2], top), up(fp[2], peak), WHITE);
+        K.wall('silver', fp[2], fp[3], top, peak, WHITE, 0, 0);
+      } },
+    { id: 'panam', name: 'Pan Am Building (MetLife)', era: 'both', ll: [40.7535, -73.976389], r: 60, base: 15,
+      build(K, P, b) {
+        K.tier('precast', 0, 0, 90, 50, GRID, b - 20, b + 40, WHITE, [0.5, 0.5, 0.52], 0, b);
+        // elongated octagon slab, long side across the avenue
+        const f = dirOf(GRID), s = dirOf(GRID + 90), W = 37, D = 14, c = 8;
+        const P2 = (a, d) => [s[0] * a + f[0] * d, s[1] * a + f[1] * d];
+        const oct = [P2(-W, -D + 4), P2(-W + c, -D), P2(W - c, -D), P2(W, -D + 4), P2(W, D - 4), P2(W - c, D), P2(-W + c, D), P2(-W, D - 4)];
+        K.prism('precast', oct, b + 40, b + 246, [0.92, 0.92, 0.9], [0.5, 0.5, 0.52], b);
+      } },
+    { id: 'rock30', name: '30 Rockefeller Plaza', era: 'both', ll: [40.758983, -73.979283], r: 60, base: 18,
+      build(K, P, b) {
+        K.tier('deco', 0, 0, 100, 32, GRID, b - 20, b + 30, WHITE, [0.55, 0.53, 0.5], 0, b);
+        K.tier('deco', 0, 0, 92, 28, GRID, b + 30, b + 165, WHITE, [0.55, 0.53, 0.5], 0, b);
+        K.tier('deco', 0, 0, 68, 28, GRID, b + 165, b + 220, WHITE, [0.55, 0.53, 0.5], 0, b);
+        K.tier('deco', 0, 0, 40, 26, GRID, b + 220, b + 259, WHITE, [0.55, 0.53, 0.5], 0, b);
+      } },
+    { id: 'liberty', name: 'Statue of Liberty', era: 'both', ll: [40.689249, -74.0445], r: 60, base: 3,
+      build(K, P, b) {
+        // Fort Wood's 11-point star, the granite pedestal, then the copper statue raising the torch
+        const star = []; for (let i = 0; i < 22; i++) { const a = i / 22 * Math.PI * 2, rr = i % 2 ? 34 : 50; star.push([Math.sin(a) * rr, -Math.cos(a) * rr]); }
+        let run = 0; for (let i = 0; i < 22; i++) { const a = star[i], q = star[(i + 1) % 22]; K.wall('stone', a, q, b - 3, b + 8, [0.85, 0.82, 0.76], 0, 0, run); run += Math.hypot(q[0] - a[0], q[1] - a[1]); }
+        const g = K.geo('plain'), c0 = g.vcount; g.vert([0, b + 8, 0], [0, 1, 0], [0.5, 0.55, 0.42]); for (const p of star) g.vert([p[0], b + 8, p[1]], [0, 1, 0], [0.5, 0.55, 0.42]); for (let i = 0; i < 22; i++) g.tri(c0, c0 + 1 + ((i + 1) % 22), c0 + 1 + i);
+        K.tier('stone', 0, 0, 20, 20, 0, b + 8, b + 20, [0.86, 0.83, 0.78], null, 0, b);
+        K.prism('stone', K.rect(0, 0, 16, 16, 0), b + 20, b + 47, [0.88, 0.85, 0.8], [0.7, 0.68, 0.64], b);
+        const cu = [0.42, 0.63, 0.55];
+        K.spire('plain', 0, 0, b + 47, b + 60, 5.6, 4.6, 10, cu); K.spire('plain', 0, 0, b + 60, b + 75, 4.6, 3.2, 10, cu);
+        K.spire('plain', 0, 0, b + 75, b + 80, 2.2, 2.0, 8, cu); K.geo('plain').sphere([0, b + 82, 0], 2.2, cu, 6);
+        for (let i = 0; i < 7; i++) { const a = -0.9 + i * 0.3; K.spire('plain', Math.sin(a) * 2.2, -Math.cos(a) * 2.2, b + 83, b + 86.5, 0.35, 0.05, 4, cu); }
+        K.geo('plain').cyl([1.8, b + 76, -1], [4.2, b + 89, -2.4], 1.0, 0.8, 6, cu);             // raised right arm
+        K.geo('plain').cyl([4.2, b + 89, -2.4], [4.4, b + 91.5, -2.5], 1.1, 1.3, 6, [0.7, 0.62, 0.36]);
+        K.geo('glow').sphere([4.4, b + 92.6, -2.5], 1.1, [1, 0.78, 0.35], 6);                     // golden torch flame
+        K.box('plain', -3.6, b + 68, -1.2, 1.2, 6, 4, 10, cu);                                    // tablet
+      } },
+    { id: 'bkbridge', name: 'Brooklyn Bridge', era: 'both', ll: [40.70565, -73.99665], r: 950, base: 0,
+      build(K, P, b) {
+        // two granite towers 486 m apart, deck ~41 m over the East River, four main cables with suspenders
+        const BR = 135.7, f = dirOf(BR), s = dirOf(BR + 90), T = 243, DECK = 40, TOP = 84;
+        const at = (u, v) => [f[0] * u + s[0] * v, f[1] * u + s[1] * v];
+        const deckY = (u) => { const a = Math.abs(u); return a < 530 ? DECK + 2 * (1 - (a / 530) ** 2) : Math.max(4, DECK - (a - 530) * 0.08); };
+        for (const u of [-T, T]) {
+          const c = at(u, 0);
+          K.tier('stone', c[0], c[1], 40, 24, BR, -12, TOP - 10, WHITE, null, 0, 0);       // tower: 40 m across the bridge, 24 m along it
+          K.tier('stone', c[0], c[1], 42, 26, BR, TOP - 10, TOP - 7, [0.95, 0.94, 0.9], null, 0, 0);   // cornice
+          K.tier('stone', c[0], c[1], 40, 24, BR, TOP - 7, TOP, WHITE, [0.62, 0.6, 0.56], 0, 0);
+          // the two tall pointed gothic arches the roadway passes through, on both faces
+          const ga = K.geo('plain'), dark = [0.1, 0.11, 0.13];
+          for (const side of [-12.15, 12.15]) for (const v of [-9.5, 9.5]) {
+            const A = at(u + side, v - 5.2), B = at(u + side, v + 5.2), Cc = at(u + side, v);
+            const y0 = DECK - 4, y1 = 58, y2 = 68;
+            ga.fquad([A[0], y0, A[1]], [B[0], y0, B[1]], [B[0], y1, B[1]], [A[0], y1, A[1]], dark);
+            ga.ftri([A[0], y1, A[1]], [B[0], y1, B[1]], [Cc[0], y2, Cc[1]], dark);
+          }
+        }
+        // deck as a series of segments
+        const segs = 60, L0 = -900, L1 = 900;
+        for (let i = 0; i < segs; i++) {
+          const u0 = L0 + (L1 - L0) * i / segs, u1 = L0 + (L1 - L0) * (i + 1) / segs, y0 = deckY(u0), y1 = deckY(u1);
+          const a = at(u0, -13), bq = at(u1, -13), c = at(u1, 13), d = at(u0, 13);
+          K.geo('plain').fquad([a[0], y0, a[1]], [d[0], y0, d[1]], [c[0], y1, c[1]], [bq[0], y1, bq[1]], [0.5, 0.48, 0.45]);
+          K.geo('plain').fquad([a[0], y0 - 3, a[1]], [bq[0], y1 - 3, bq[1]], [c[0], y1 - 3, c[1]], [d[0], y0 - 3, d[1]], [0.3, 0.29, 0.28]);
+          for (const v of [-13, 13]) { const p = at(u0, v), q = at(u1, v); K.wall('plain', p, q, Math.min(y0, y1) - 3, Math.max(y0, y1) + 1.2, [0.62, 0.6, 0.55], at((u0 + u1) / 2, 0)[0], at((u0 + u1) / 2, 0)[1]); }
+        }
+        // main cables (catenary) and vertical suspenders
+        const cable = (u) => { const a = Math.abs(u); if (a <= T) return DECK + 3 + (TOP - 4 - DECK - 3) * (u / T) ** 2; return Math.max(deckY(u) + 1, TOP - 4 - (a - T) * 0.18); };
+        for (const v of [-12, -4, 4, 12]) {
+          for (let u = -560; u < 560; u += 14) {
+            const p = at(u, v), q = at(u + 14, v);
+            K.geo('metal').cyl([p[0], cable(u), p[1]], [q[0], cable(u + 14), q[1]], 0.45, 0.45, 4, [0.78, 0.76, 0.7], false);
+            if (Math.abs(u) > 10 && Math.abs(Math.abs(u) - T) > 25 && cable(u) - deckY(u) > 2) K.geo('metal').cyl([p[0], deckY(u), p[1]], [p[0], cable(u), p[1]], 0.1, 0.1, 3, [0.7, 0.7, 0.66], false);
+          }
+        }
+      } },
+  ];
+  // OpenStreetMap buildings that did not exist before Sept 2001 (hidden in 1990s mode), and pre-2001 towers kept
+  const NEW_TOWERS = [[40.7130, -74.0132], [40.7101, -74.0119], [40.7113, -74.0117], [40.7095, -74.0121], [40.7133, -74.0120], [40.7615, -73.9718], [40.7663, -73.9810], [40.7654, -73.9792],
+    [40.7646, -73.9772], [40.7671, -73.9805], [40.7614, -73.9776], [40.7530, -73.9786], [40.7556, -73.9845], [40.7562, -73.9902], [40.7665, -73.9839], [40.7538, -74.0010], [40.7543, -74.0023],
+    [40.7524, -74.0007], [40.7537, -74.0028], [40.7541, -73.9993], [40.7550, -73.9988], [40.7524, -73.9963], [40.7110, -74.0056], [40.7181, -74.0059], [40.7135, -74.0088], [40.7685, -73.9828],
+    [40.7524, -73.9686], [40.7593, -73.9719], [40.7577, -73.9711], [40.7069, -74.0127], [40.7470, -73.9866]];
+  const OLD_TALL = [[40.748441, -73.985664], [40.751652, -73.975311], [40.70694, -74.00913], [40.706389, -74.007778], [40.758333, -73.970278], [40.758983, -73.979283], [40.7535, -73.976389],
+    [40.712361, -74.008194], [40.7084, -74.0091], [40.7651, -73.9799], [40.7631, -73.9873], [40.7651, -73.9802], [40.7559, -73.9864], [40.7514, -73.9918], [40.7095, -74.0108], [40.7062, -74.0086],
+    [40.7558, -73.9776], [40.7146, -74.0151], [40.7136, -74.0163], [40.7124, -74.0159], [40.7614, -73.9741]];
+
+  class Landmarks {
+    constructor(r) { this.r = r; this.items = []; this.key = null; this.tex = null; this.zones = null; }
+    static era() { const u = window.__ui; return (u && u.cfg && u.cfg.nycEra) || (window.LP_NYC_ERA) || '1990s'; }
+    // world-space helpers (recomputed when the world origin moves)
+    _zones() {
+      if (this.zones && this.zones.ov === Geo.originVersion) return this.zones;
+      const xz = (ll) => toXZ(ll[0], ll[1]);
+      const lm = LANDMARKS.map((L) => ({ L, c: xz(L.ll) }));
+      return (this.zones = { ov: Geo.originVersion, lm, nyc: xz(NYC), newT: NEW_TOWERS.map(xz), oldT: OLD_TALL.map(xz) });
+    }
+    // called by Buildings for each OpenStreetMap footprint: true = don't draw it
+    suppress(x, z, h, tags) {
+      const Z = this._zones(), era = Landmarks.era();
+      if (Math.hypot(x - Z.nyc[0], z - Z.nyc[1]) > 40000) return false;
+      for (const { L, c } of Z.lm) { if (L.era === '1990s' && era !== '1990s') continue; if (L.id === 'bkbridge') continue; const rr = L.id === 'wtc' ? 230 : L.r; if (Math.hypot(x - c[0], z - c[1]) < rr) return true; }  // ours replaces it
+      if (era !== '1990s') return false;
+      const sd = parseInt(tags && (tags.start_date || tags['construction_date'] || ''), 10); if (sd >= 2001) return true;
+      for (const p of Z.newT) if (Math.hypot(x - p[0], z - p[1]) < 55) return true;
+      if (h > 225) { for (const p of Z.oldT) if (Math.hypot(x - p[0], z - p[1]) < 70) return false; return true; }
+      return false;
+    }
+    _build() {
+      for (const it of this.items) for (const k in it.m) this.r.deleteMesh(it.m[k]);
+      this.items = []; if (!this.tex) this.tex = textures(this.r);
+      const era = Landmarks.era();
+      for (const L of LANDMARKS) {
+        if (L.era === '1990s' && era !== '1990s') continue;
+        const c = toXZ(L.ll[0], L.ll[1]), K = new Kit();
+        const P = (ll) => { const p = toXZ(ll[0], ll[1]); return [p[0] - c[0], p[1] - c[1]]; };
+        try { L.build(K, P, L.base); } catch (e) { console.warn('landmark ' + L.id, e); continue; }
+        this.items.push({ L, cx: c[0], cz: c[1], m: K.build(this.r) });
+      }
+      this.key = era + '/' + Geo.originVersion;
+    }
+    near(cam) { const Z = this._zones(); return Math.hypot(cam[0] - Z.nyc[0], cam[2] - Z.nyc[1]) < 120000; }
+    // Shadow-pass safe (ctx.shadowPass): only geometry is drawn
+    render(lit, ctx) {
+      const cam = ctx.cam; if (!this.near(cam)) return;
+      const era = Landmarks.era(); if (this.key !== era + '/' + Geo.originVersion) { if (ctx.shadowPass) return; this._build(); }
+      const T = this.tex, sp = !!ctx.shadowPass, night = sp ? 0 : Eng.smooth(0.15, 0.6, ctx.night || 0);
+      const vis = this._vis || (this._vis = []); vis.length = 0;
+      for (const it of this.items) {
+        const dx = it.cx - cam[0], dz = it.cz - cam[2], d2 = dx * dx + dz * dz;
+        if (d2 > (sp ? 6000 * 6000 : 9.0e4 * 9.0e4)) continue;
+        vis.push([it, Eng.M.fromQT([0, 0, 0, 1], [dx, -cam[1] - d2 / (2 * Geo.R_EARTH), dz])]);
+      }
+      if (!vis.length) return;
+      const gl = this.r.gl; gl.disable(gl.CULL_FACE);
+      lit.begin(ctx, { spec: 0.15 });
+      const o = this._o || (this._o = {});
+      for (const [it, mm] of vis) for (const k in it.m) {
+        const M = MAT[k]; o.tex = M[0] ? T[M[0]] : null; o.spec = M[3]; o.gloss = M[4]; o.emissive = k === 'glow' ? 0.4 + night * 1.4 : 0; o.metal = k === 'metal' ? 0.6 : 0;
+        lit.draw(it.m[k], mm, o);
+      }
+      if (night > 0.01) {   // lit windows on top
+        gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.depthMask(false);
+        const n = this._n || (this._n = { tex: null, emissive: 1 });
+        for (const [it, mm] of vis) {
+          const fade = 1 - Eng.smooth(25000, 70000, Math.hypot(mm[12], mm[14]));
+          for (const k in it.m) { const lt = T[k + 'Lit']; if (!lt) continue; n.tex = lt; n.emissive = night * 0.85 * fade; lit.draw(it.m[k], mm, n); }
+        }
+        gl.depthMask(true); gl.disable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      }
+      gl.enable(gl.CULL_FACE);
+    }
+  }
+
+  // ===================================================================== NYCCity: every building in New York
+  // Streams the city's own building database (NYC Open Data "Building Footprints": footprint, roof height and the year
+  // each building was built) around the airplane, all five boroughs. Three height bands with their own tile size and
+  // range, so the skyline shows from far away and the small buildings fill in as you get close:
+  //   tall  > 90 m       0.05° tiles, the whole city
+  //   mid   25 – 90 m    0.02° tiles, within ~9 km
+  //   low   < 25 m       0.01° tiles, within ~3.5 km
+  // 1990s mode hides everything built in 2001 or later. Falls back to OpenStreetMap (Overpass) if the city's server
+  // can't be reached; if neither can, the hand-built landmarks above are what you get.
+  const NYC_BOX = [40.49, -74.27, 40.92, -73.68];     // south, west, north, east
+  const SOCRATA = 'https://data.cityofnewyork.us/resource/5zhs-2jue.geojson';
+  const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+  const BANDS = [
+    { id: 'tall', deg: 0.05, range: 45000, lo: 90, hi: 1e4 },
+    { id: 'mid', deg: 0.02, range: 9000, lo: 25, hi: 90 },
+    { id: 'low', deg: 0.01, range: 3500, lo: 0, hi: 25 },
+  ];
+  const FT = 0.3048;
+  // field names have changed over the years; try the variants until one works
+  const VARIANTS = [{ g: 'the_geom', h: 'heightroof', y: 'cnstrct_yr' }, { g: 'the_geom', h: 'height_roof', y: 'construction_year' }, { g: 'geom', h: 'height_roof', y: 'construction_year' }];
+  class NYCCity {
+    constructor(r, tex) {
+      this.r = r; this.tex = tex; this.tiles = new Map(); this.queue = []; this.active = 0; this.src = null; this.variant = -1;
+      this.failSocrata = 0; this.failOSM = 0; this.status = 'idle'; this.count = 0; this.ov = -1; this.era = null; this.loadedBox = [];
+    }
+    static inBox(lat, lon) { return lat > NYC_BOX[0] && lat < NYC_BOX[2] && lon > NYC_BOX[1] && lon < NYC_BOX[3]; }
+    // is a world point inside a tile that has the city data? (OSM buildings there are skipped)
+    covers(x, z) {
+      if (!this.tiles.size) return false; const [lat, lon] = Geo.toLatLon(x, z);
+      if (!NYCCity.inBox(lat, lon)) return false;
+      const k = 'low:' + Math.floor(lat / 0.01) + ':' + Math.floor(lon / 0.01), T = this.tiles.get(k);
+      return !!(T && T.raw);
+    }
+    async _socrata(band, s, w, n, e) {
+      const order = this.variant >= 0 ? [this.variant] : [0, 1, 2];
+      let last = 'unreachable';
+      for (const vi of order) {
+        const V = VARIANTS[vi];
+        const where = `within_box(${V.g},${n},${w},${s},${e}) AND ${V.h} ${band.lo ? '> ' + (band.lo / FT).toFixed(0) : '>= 0'}${band.hi < 1e4 ? ' AND ' + V.h + ' <= ' + (band.hi / FT).toFixed(0) : ''}`;
+        const url = `${SOCRATA}?$limit=50000&$select=${V.g},${V.h},${V.y}&$where=${encodeURIComponent(where)}`;
+        try {
+          const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 40000);
+          const r = await fetch(url, { signal: ctl.signal }); clearTimeout(to);
+          if (r.status === 400) { last = 'query'; continue; }          // wrong field names: try the next variant
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          const j = await r.json(); this.variant = vi;
+          const out = [];
+          for (const f of j.features || []) {
+            const g = f.geometry; if (!g) continue; const P = f.properties || {};
+            const hm = parseFloat(P[V.h]) * FT, yr = parseInt(P[V.y], 10);
+            const polys = g.type === 'MultiPolygon' ? g.coordinates : g.type === 'Polygon' ? [g.coordinates] : [];
+            for (const poly of polys) { const ring = poly[0]; if (!ring || ring.length < 4) continue; out.push({ h: isFinite(hm) && hm > 2 ? hm : 8, yr: isFinite(yr) ? yr : 0, pts: ring.map((c) => [c[1], c[0]]) }); }
+          }
+          return out;
+        } catch (e) { last = e.name === 'AbortError' ? 'timed out' : 'blocked'; break; }
+      }
+      throw new Error(last);
+    }
+    async _osm(band, s, w, n, e) {
+      const q = `[out:json][timeout:60];(way["building"](${s},${w},${n},${e}););out geom qt;`;
+      let last = 'unreachable';
+      for (const url of OVERPASS) {
+        try {
+          const r = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+          if (!r.ok) { last = 'HTTP ' + r.status; continue; }
+          const j = await r.json(), out = [];
+          for (const el of j.elements || []) {
+            if (!el.geometry || el.geometry.length < 4) continue; const tg = el.tags || {};
+            let h = parseFloat(tg.height); if (!isFinite(h)) { const l = parseFloat(tg['building:levels']); h = isFinite(l) ? l * 3.4 + 2 : 9; }
+            if (h <= band.lo || h > band.hi) continue;
+            out.push({ h, yr: parseInt(tg.start_date, 10) || 0, pts: el.geometry.map((g) => [g.lat, g.lon]) });
+          }
+          return out;
+        } catch (e) { last = 'blocked'; }
+      }
+      throw new Error(last);
+    }
+    async _fetch(T) {
+      const { band, s, w, n, e } = T;
+      if (this.failSocrata < 3) { try { const d = await this._socrata(band, s, w, n, e); this.failSocrata = 0; this.src = 'NYC Open Data'; return d; } catch (err) { this.failSocrata++; this.lastErr = err.message; } }
+      if (this.failOSM < 3) { try { const d = await this._osm(band, s, w, n, e); this.failOSM = 0; this.src = 'OpenStreetMap'; return d; } catch (err) { this.failOSM++; this.lastErr = err.message; } }
+      throw new Error(this.lastErr || 'unreachable');
+    }
+    // turn raw rows into a Buildings mesh set for one tile
+    async _mesh(T) {
+      const era = Landmarks.era(), L = Landmarks._inst;
+      const elements = [];
+      for (const b of T.raw) {
+        if (era === '1990s' && b.yr >= 2001) continue;
+        const tags = { building: 'yes', height: String(b.h.toFixed(1)) };
+        if (b.yr) tags.start_date = String(b.yr);
+        // pre-1960: brick and stone; later towers: a mix of glass curtain walls and stone/precast with punched windows
+        const hh = Math.abs(Math.sin(b.pts[0][0] * 9301.7 + b.pts[0][1] * 4971.3)) % 1;
+        if ((b.yr && b.yr < 1960 && b.h < 150) || (!b.yr && b.h < 40) || (b.h >= 38 && hh < 0.45)) tags._masonry = 1;
+        elements.push({ type: 'way', tags, geometry: b.pts.map((p) => ({ lat: p[0], lon: p[1] })) });
+      }
+      const B = T.bld || (T.bld = new Buildings(this.r, this.tex)); B.isNYC = true;
+      B.raw = { t: { elements } }; B.ids = ['t']; B.terrain = this.terrain;
+      T.ov = Geo.originVersion; T.era = era;
+      await B._rebuildAsync();
+      this.count = 0; for (const X of this.tiles.values()) if (X.bld) this.count += X.bld.count;
+    }
+    update(cam, terrain) {
+      this.terrain = terrain;
+      const [clat, clon] = Geo.toLatLon(cam[0], cam[2]);
+      // the airplane has to be near the city
+      if (clat < NYC_BOX[0] - 0.4 || clat > NYC_BOX[2] + 0.4 || clon < NYC_BOX[1] - 0.5 || clon > NYC_BOX[3] + 0.5) return;
+      const era = Landmarks.era();
+      // world origin moved or era switched: rebuild the meshes from the rows we already have
+      if (this.ov !== Geo.originVersion || this.era !== era) { this.ov = Geo.originVersion; this.era = era; for (const T of this.tiles.values()) if (T.raw) T.stale = true; }
+      for (const T of this.tiles.values()) if (T.stale && !T.busy) { T.stale = false; T.busy = true; this._mesh(T).finally(() => { T.busy = false; }); break; }
+      if (this.failSocrata >= 3 && this.failOSM >= 3) { this.status = 'blocked (' + (this.lastErr || '') + ')'; return; }
+      const mlat = 111320, mlon = 111320 * Math.cos(clat * Math.PI / 180);
+      for (const band of BANDS) {
+        const d = band.deg, rl = band.range / mlat, ro = band.range / mlon;
+        for (let i = Math.floor(Math.max(NYC_BOX[0], clat - rl) / d); i <= Math.floor(Math.min(NYC_BOX[2], clat + rl) / d); i++)
+          for (let j = Math.floor(Math.max(NYC_BOX[1], clon - ro) / d); j <= Math.floor(Math.min(NYC_BOX[3], clon + ro) / d); j++) {
+            const k = band.id + ':' + i + ':' + j; if (this.tiles.has(k)) continue;
+            const s = i * d, w = j * d, dist = Math.hypot((s + d / 2 - clat) * mlat, (w + d / 2 - clon) * mlon);
+            if (dist > band.range) continue;
+            const T = { k, band, s, w, n: s + d, e: w + d, dist, raw: null, bld: null };
+            this.tiles.set(k, T); this.queue.push(T);
+          }
+      }
+      // nearest first; 4 downloads at a time
+      if (this.queue.length) {
+        for (const T of this.queue) T.dist = Math.hypot((T.s + T.band.deg / 2 - clat) * mlat, (T.w + T.band.deg / 2 - clon) * mlon) / (T.band.id === 'tall' ? 3 : 1);
+        this.queue.sort((a, b) => a.dist - b.dist);
+        while (this.active < 4 && this.queue.length) {
+          const T = this.queue.shift(); this.active++; this.status = 'loading';
+          this._fetch(T).then(async (rows) => { T.raw = rows; await this._mesh(T); this.status = `${this.count} buildings (${this.src})`; })
+            .catch(() => { this.tiles.delete(T.k); })
+            .finally(() => { this.active--; });
+        }
+      }
+      // free detail tiles we've flown far away from
+      for (const [k, T] of this.tiles) {
+        if (T.band.id === 'tall' || T.busy) continue;
+        const dd = Math.hypot((T.s + T.band.deg / 2 - clat) * mlat, (T.w + T.band.deg / 2 - clon) * mlon);
+        if (dd > T.band.range * 1.6 && T.raw) { if (T.bld) for (const c of T.bld.chunks) T.bld._freeChunk(c); this.tiles.delete(k); }
+      }
+    }
+    render(lit, ctx) { for (const T of this.tiles.values()) if (T.bld && T.bld.chunks.length) T.bld.render(lit, ctx); }
+  }
+  window.NYCCity = NYCCity;
+  Landmarks.LIST = LANDMARKS;
+  window.Landmarks = Landmarks;
+})();
+</script>
+<script>/* ==== worldgen.js ==== */// ===== worldgen.js : built-in "synthetic satellite" world used when real imagery can't be downloaded =====
 // Paints cities (street grids, suburbs, commercial areas, freeways), the two airports (taxiways, aprons,
 // terminals), Lake Mead and the Strip onto terrain tiles, and builds matching 3D terminals, concourses,
 // jet bridges, parked airliners, garages, hangars and city towers.
@@ -4780,6 +5334,30 @@ void main(){ vec4 t = texture(uTex, vUV); if (t.a < 0.4) discard; vec3 col = vec
   const art = (pts, w = 30) => W.roads.push({ pts: polyLL(pts), w, kind: 'art' });
   art([[36.05, -115.172], [36.0905, -115.1728], [36.100, -115.1735], [36.120, -115.1712], [36.137, -115.163], [36.147, -115.156], [36.175, -115.141]], 40);
   art([[36.1005, -115.21], [36.1005, -115.06]], 32); // Tropicana
+  // ---- New York: metro area plus the harbour, rivers, Jamaica Bay, Long Island Sound and the Atlantic
+  W.cities.push({ name: 'New York', poly: polyLL([[39.95, -74.75], [40.45, -74.85], [41.15, -74.55], [41.35, -73.95], [41.25, -73.2], [40.95, -72.6], [40.62, -72.6], [40.5, -73.6], [40.25, -74.05], [39.95, -74.3]]) });
+  const NYW = [
+    // Atlantic / Lower Bay / Raritan Bay
+    [[40.73, -72.4], [40.63, -73.3], [40.59, -73.75], [40.578, -73.95], [40.572, -74.01], [40.545, -74.055], [40.51, -74.15], [40.495, -74.255], [40.465, -74.27], [40.44, -74.18], [40.425, -74.06],
+     [40.47, -74.005], [40.43, -73.995], [40.25, -74.0], [39.95, -74.08], [39.6, -74.2], [39.6, -72.4]],
+    // Upper Bay and the Narrows
+    [[40.703, -74.018], [40.70, -74.045], [40.685, -74.063], [40.665, -74.075], [40.645, -74.085], [40.625, -74.075], [40.61, -74.055], [40.598, -74.045], [40.585, -74.06], [40.57, -74.06],
+     [40.575, -74.01], [40.60, -74.03], [40.62, -74.035], [40.64, -74.025], [40.655, -74.02], [40.675, -74.02], [40.69, -74.012], [40.70, -74.005]],
+    // Hudson River
+    [[40.700, -74.017], [40.720, -74.0135], [40.740, -74.0115], [40.760, -74.0035], [40.780, -73.990], [40.800, -73.973], [40.830, -73.955], [40.860, -73.937], [40.880, -73.925], [40.95, -73.910], [41.05, -73.895],
+     [41.05, -73.925], [40.95, -73.935], [40.880, -73.955], [40.860, -73.965], [40.830, -73.983], [40.800, -74.004], [40.780, -74.0135], [40.760, -74.0225], [40.740, -74.027], [40.720, -74.033], [40.700, -74.036]],
+    // East River and Hell Gate
+    [[40.700, -74.012], [40.703, -74.005], [40.708, -73.998], [40.711, -73.978], [40.725, -73.9725], [40.745, -73.9695], [40.760, -73.958], [40.775, -73.944], [40.786, -73.937], [40.795, -73.925], [40.80, -73.905],
+     [40.792, -73.905], [40.782, -73.924], [40.768, -73.936], [40.752, -73.951], [40.737, -73.9605], [40.716, -73.963], [40.704, -73.975], [40.700, -73.99], [40.696, -74.0]],
+    // Flushing / Bowery Bay north of LaGuardia and Long Island Sound
+    [[40.80, -73.905], [40.789, -73.89], [40.786, -73.86], [40.79, -73.84], [40.80, -73.82], [40.80, -73.78], [40.83, -73.70], [40.88, -73.55], [40.92, -73.30], [40.96, -72.9], [41.1, -72.6], [41.27, -72.6],
+     [41.15, -73.15], [41.05, -73.45], [40.95, -73.65], [40.88, -73.76], [40.83, -73.80], [40.815, -73.85], [40.81, -73.9]],
+    // Jamaica Bay
+    [[40.585, -73.925], [40.61, -73.935], [40.635, -73.905], [40.652, -73.862], [40.646, -73.832], [40.622, -73.812], [40.6, -73.82], [40.585, -73.86]],
+    // Newark Bay and the Kill van Kull
+    [[40.645, -74.085], [40.64, -74.16], [40.67, -74.16], [40.70, -74.13], [40.71, -74.12], [40.69, -74.115], [40.66, -74.12], [40.655, -74.09]],
+  ];
+  for (const w of NYW) W.water.push(polyLL(w));
   // dry Salt River bed beside Sky Harbor
   W.dirt.push({ pts: polyLL([[33.415, -112.20], [33.418, -112.10], [33.4215, -112.04], [33.423, -111.99], [33.428, -111.94], [33.43, -111.90]]), w: 260 });
 
@@ -17876,7 +18454,7 @@ void main(){
       this.r = new Eng.Renderer(canvas);
       this.lit = new Scene.Lit(this.r);
       this.sky = new FX.Sky(this.r); this.clouds = new FX.Clouds(this.r); this.lights = new FX.Lights(this.r); this.particles = new FX.Particles(this.r);
-      this.terrain = new Terrain(this.r); this.airports = new Airports(this.r); this.buildings = window.Buildings ? new Buildings(this.r) : null;
+      this.terrain = new Terrain(this.r); this.airports = new Airports(this.r); this.buildings = window.Buildings ? new Buildings(this.r) : null; this.landmarks = window.Landmarks ? (Landmarks._inst = new Landmarks(this.r)) : null; this.nycCity = window.NYCCity ? (NYCCity._inst = new NYCCity(this.r, this.buildings ? this.buildings.tex : null)) : null;
       this.cockpit = null;
       this.keys = {}; this.stick = { pitch: 0, roll: 0, yaw: 0 }; this.mouse = { x: 0, y: 0, nx: 0, ny: 0, inside: false };
       this.view = 'cockpit'; this.camState = { chaseYaw: 0, chasePitch: 10, chaseDist: 58, orbitYaw: 30, orbitPitch: 12, orbitDist: 70, fov: 60, smoothPos: null, smoothQ: null };
@@ -19212,6 +19790,8 @@ void main(){
       // real imagery on screen -> real OpenStreetMap buildings; otherwise the built-in world's 3D city
       if (this.terrain.showingImagery()) { if (this.buildings) this.buildings.render(this.lit, ctx); }
       else if (window.WorldGen) { if (!this.procCity) this.procCity = new WorldGen.ProcCity(this); if (!this.procCity.built && !this.loadingTerrain) this.procCity.build(this.terrain); this.procCity.render(ctx); }
+      if (this.landmarks) this.landmarks.render(this.lit, ctx);   // New York landmarks (incl. the 1990s World Trade Center)
+      if (this.nycCity) { const tn = performance.now(); if (!(tn - (this._nycT || 0) < 400)) { this._nycT = tn; this.nycCity.update(ctx.cam, this.terrain); } this.nycCity.render(this.lit, ctx); }   // every building in New York City
       // aircraft exterior
       if (!this.hideAircraft && !inCockpit) this.drawAircraft(ctx, pose);
       if (this.crashed && !this.replay.playing) this.drawDebris(ctx);
@@ -19278,6 +19858,8 @@ void main(){
           SL.begin(s); SL.cullR = 120;
           for (const it of this.airports.items) if (it.tower) SL.draw(it.tower, SL.modelRel([it.ap.x, 0, it.ap.z], [0, 0, 0, 1]));
           if (img) { if (this.buildings) { SL.cullR = 1300; this.buildings.render(SL, s); } }
+          if (this.landmarks) { SL.cullR = 2000; this.landmarks.render(SL, s); }
+          if (this.nycCity) { SL.cullR = 1300; this.nycCity.render(SL, s); }
           else if (this.procCity && this.procCity.built && !this.procCity._gen) { SL.cullR = 2400; this.procCity.render(s); }
           SL.cullR = 0; this.terrain.renderProps(SL, s, nodes);
           if (this.traffic) this.traffic.render(s);
@@ -19664,7 +20246,7 @@ void main(){
   class UI {
     constructor(root) {
       this.root = root; this.toasts = []; this.profile = LS.get('linepilot.profile', { name: '', airline: 'southwest', difficulty: 'normal', flights: 0, hours: 0, landings: 0, best: null });
-      this.cfg = { airline: this.profile.airline || 'southwest', difficulty: this.profile.difficulty || 'normal', mode: 'full', weather: 'live', time: 'real', failures: this.profile.failures || 'career', tutorial: this.profile.tutorial || 'on', airMinutes: this.profile.airMinutes || 10, guide: this.profile.guide || 'auto', gate: this.profile.gate || 'on', freeType: this.profile.freeType || 'b738' };
+      this.cfg = { airline: this.profile.airline || 'southwest', difficulty: this.profile.difficulty || 'normal', mode: 'full', weather: 'live', time: 'real', failures: this.profile.failures || 'career', tutorial: this.profile.tutorial || 'on', airMinutes: this.profile.airMinutes || 10, guide: this.profile.guide || 'auto', nycEra: this.profile.nycEra || '1990s', gate: this.profile.gate || 'on', freeType: this.profile.freeType || 'b738' };
       this._build();
       this._initNet();
     }
@@ -19873,6 +20455,7 @@ void main(){
         <section><h3>Difficulty</h3><div class="seg diff"></div><div class="desc diffdesc"></div></section>
         <section><h3>Weather (free flight & practice)</h3><div class="seg wx"></div><div class="desc">Airline job flights always use the real weather: live reports for today, the forecast for future days.</div></section>
         <section><h3>Time of day (free flight & practice)</h3><div class="seg time"></div></section>
+        <section><h3>New York skyline</h3><div class="seg nycera"></div><div class="desc">1990s: the original World Trade Center Twin Towers (with the North Tower's antenna), the old 7 WTC and the low WTC buildings, and no towers built after 2001. Today: the skyline without the Twin Towers. The Empire State, Chrysler, Woolworth, Citicorp and Pan Am buildings, 30 Rock, 40 Wall Street, 70 Pine, the Brooklyn Bridge and the Statue of Liberty are in both, even when map downloads are blocked.</div></section>
         <section><h3>Approach guide line</h3><div class="seg guide"></div><div class="desc">A 3D path of boxes in the sky leading down to the runway on the perfect 3° glide path, plus FLARE and IDLE prompts near the ground. Fly through the boxes. The boxes turn green when you are on the path.</div></section>
         <section><h3>Gate to gate</h3><div class="seg gate"></div><div class="desc">Airline flights start parked at a real gate: push back (P), taxi on the real taxiways with Ground and Tower, and park at a gate at the destination. Landing practice then also taxis in. Off: start lined up on the runway and finish when you stop. (Off while Teach me lessons are on.)</div></section>
         <section><h3>Flight length</h3><div class="seg alen"></div><div class="desc">You fly the whole flight. Takeoff and the last miles of the approach are at normal speed; climb, cruise and descent speed up automatically (up to 12× with the autopilot on, 2× hand-flying) so you're in the air for about this long. Pressing [ or ] switches to manual control.</div></section>
@@ -19886,6 +20469,7 @@ void main(){
       seg('.time', 'time', [['real', 'Real time'], ['morning', 'Morning'], ['noon', 'Noon'], ['sunset', 'Sunset'], ['night', 'Night']]);
       seg('.tut', 'tutorial', [['on', 'Teach me'], ['off', 'No lessons']]);
       seg('.gate', 'gate', [['on', 'Start at the gate'], ['off', 'Start on the runway']]);
+      seg('.nycera', 'nycEra', [['1990s', '1990s (Twin Towers)'], ['today', 'Today']]);
       seg('.guide', 'guide', [['auto', 'Lessons & landing practice'], ['on', 'Every flight'], ['off', 'Off']]);
       seg('.alen', 'airMinutes', [[10, 'About 10 min'], [15, 'About 15 min'], ['real', 'Real time']]);
       seg('.fail', 'failures', [['career', 'Realistic (1 in 20)'], ['training', 'Every flight'], ['off', 'Off']]);
@@ -19895,7 +20479,7 @@ void main(){
       if (!log.length) rows.append(h('div', { class: 'empty' }, 'No flights yet.'));
       for (const e of log.slice(-12).reverse()) rows.append(h('div', { class: 'logrow', html: `<span class="g g${e.grade}">${e.grade}</span><span>${new Date(e.date).toLocaleDateString()}</span><span>${e.airline} ${e.callsign || ''}</span><span>${e.route}</span><span>${e.fpm != null ? Math.round(e.fpm) + ' fpm' : (e.crash ? 'CRASH' : '—')}</span><span>${e.total}/100</span>` }));
     }
-    _saveSettings() { const p = this.profile, c = this.cfg; p.difficulty = c.difficulty; p.failures = c.failures; p.tutorial = c.tutorial; p.airMinutes = c.airMinutes; p.guide = c.guide; p.gate = c.gate; p.freeType = c.freeType; LS.set('linepilot.profile', p); }
+    _saveSettings() { const p = this.profile, c = this.cfg; p.difficulty = c.difficulty; p.failures = c.failures; p.tutorial = c.tutorial; p.airMinutes = c.airMinutes; p.guide = c.guide; if (p.nycEra !== c.nycEra && window.__game && __game.buildings && __game.buildings.raw) { p.nycEra = c.nycEra; try { __game.buildings.rebuild(); } catch (e) { } } p.nycEra = c.nycEra; p.gate = c.gate; p.freeType = c.freeType; LS.set('linepilot.profile', p); }
     _quickSettings(el) {
       const c = this.cfg; el.innerHTML = '';
       const mk = (key, opts) => { const s = h('div', { class: 'seg small' }); for (const [v, tx] of opts) s.append(h('button', { class: c[key] === v ? 'on' : '', onclick: () => { c[key] = v; this._saveSettings(); this._quickSettings(el); } }, tx)); return s; };
