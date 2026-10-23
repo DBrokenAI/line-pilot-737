@@ -18081,25 +18081,67 @@ void main(){
     return JSON.parse(txt);
   }
 
+
+  // ---- relay: when the two computers can't talk directly (strict home routers, phone networks, firewalls) the
+  // game messages go through a free public MQTT server instead. Same 6-letter code; nothing to set up.
+  const RELAYS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt', 'wss://test.mosquitto.org:8081/mqtt'];
+  const TOPIC = (code, who) => `linepilot/v1/${code}/${who}`;
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  const mqStr = (s) => { const b = enc.encode(s); const o = new Uint8Array(2 + b.length); o[0] = b.length >> 8; o[1] = b.length & 255; o.set(b, 2); return o; };
+  const mqPkt = (type, parts) => {
+    let n = 0; for (const p of parts) n += p.length;
+    const len = []; let x = n; do { let d = x % 128; x = Math.floor(x / 128); if (x > 0) d |= 128; len.push(d); } while (x > 0);
+    const o = new Uint8Array(1 + len.length + n); o[0] = type; o.set(len, 1); let k = 1 + len.length; for (const p of parts) { o.set(p, k); k += p.length; } return o;
+  };
+  class Relay {
+    constructor(url) { this.url = url; this.ok = false; this.subs = {}; this.buf = new Uint8Array(0); this.pid = 1; }
+    connect(ms = 8000) {
+      return new Promise((res, rej) => {
+        let ws; try { ws = new WebSocket(this.url, ['mqtt']); } catch (e) { return rej(e); }
+        this.ws = ws; ws.binaryType = 'arraybuffer';
+        const to = setTimeout(() => { rej(new Error('timeout')); try { ws.close(); } catch (e) { } }, ms);
+        ws.onopen = () => { ws.send(mqPkt(0x10, [mqStr('MQTT'), new Uint8Array([4, 2, 1, 44]), mqStr('lp' + rid(12))])); };   // keep-alive 300 s
+        ws.onmessage = (e) => {
+          const add = new Uint8Array(e.data), b = new Uint8Array(this.buf.length + add.length); b.set(this.buf); b.set(add, this.buf.length); this.buf = b;
+          for (;;) {
+            if (this.buf.length < 2) break;
+            let mul = 1, len = 0, i = 1, d; do { if (i >= this.buf.length) return; d = this.buf[i++]; len += (d & 127) * mul; mul *= 128; } while (d & 128);
+            if (this.buf.length < i + len) break;
+            const type = this.buf[0] >> 4, body = this.buf.subarray(i, i + len); this.buf = this.buf.slice(i + len);
+            if (type === 2) { clearTimeout(to); if (body[1] === 0) { this.ok = true; this._ping = setInterval(() => { try { ws.send(new Uint8Array([0xC0, 0])); } catch (x) { } }, 25000); res(this); } else rej(new Error('refused')); }
+            else if (type === 3) { const tl = (body[0] << 8) | body[1], topic = dec.decode(body.subarray(2, 2 + tl)), fn = this.subs[topic]; if (fn) try { fn(dec.decode(body.subarray(2 + tl))); } catch (x) { console.warn(x); } }
+          }
+        };
+        ws.onerror = () => { clearTimeout(to); rej(new Error('blocked')); };
+        ws.onclose = () => { this.ok = false; clearInterval(this._ping); if (this.onclose) this.onclose(); };
+      });
+    }
+    sub(topic, fn) { this.subs[topic] = fn; const id = this.pid++; this.ws.send(mqPkt(0x82, [new Uint8Array([id >> 8, id & 255]), mqStr(topic), new Uint8Array([0])])); }
+    pub(topic, s) { if (!this.ok) return; try { this.ws.send(mqPkt(0x30, [mqStr(topic), enc.encode(s)])); } catch (e) { } }
+    close() { this.ok = false; clearInterval(this._ping); try { this.ws && this.ws.send(new Uint8Array([0xE0, 0])); this.ws && this.ws.close(); } catch (e) { } }
+  }
+  // connect to every relay server that answers (the two players might each reach a different one)
+  async function relaysUp(ms) { const r = await Promise.allSettled(RELAYS.map((u) => new Relay(u).connect(ms))); return r.filter((x) => x.status === 'fulfilled').map((x) => x.value); }
+
   class Net {
     constructor() { this.pc = null; this.dc = null; this.ws = null; this.role = null; this.status = 'idle'; this.code = null; this.remoteInfo = null; this.remote = null; this.listeners = {}; this.lastSend = 0; this.chat = []; }
     on(ev, fn) { (this.listeners[ev] = this.listeners[ev] || []).push(fn); }
     emit(ev, d) { for (const f of this.listeners[ev] || []) try { f(d); } catch (e) { console.error(e); } }
-    get connected() { return this.status === 'connected' && this.dc && this.dc.readyState === 'open'; }
+    get connected() { return this.status === 'connected' && ((this.dc && this.dc.readyState === 'open') || (this.via === 'relay' && this.rl && this.rl.ok)); }
     setStatus(s, detail) { this.status = s; this.detail = detail || ''; this.emit('status', { status: s, detail }); }
-    close() { try { this.dc && this.dc.close(); } catch (e) { } try { this.pc && this.pc.close(); } catch (e) { } const w = this.ws; this.ws = null; this.role = null; try { w && w.close(); } catch (e) { } this._stopTicker(); clearTimeout(this._iceTO); clearTimeout(this._joinTO); clearInterval(this._hi); this._onBroker = null; this.pc = this.dc = null; this.remote = null; this.remoteInfo = null; this.setStatus('idle'); }
+    close() { try { this.dc && this.dc.close(); } catch (e) { } try { this.pc && this.pc.close(); } catch (e) { } const w = this.ws; this.ws = null; this.role = null; try { w && w.close(); } catch (e) { } this._stopTicker(); clearTimeout(this._iceTO); clearTimeout(this._joinTO); clearInterval(this._hi); this._onBroker = null; this.pc = this.dc = null; this.remote = null; this.remoteInfo = null; clearTimeout(this._relayTO); for (const r of this._relays || []) r.close(); if (this.rl) this.rl.close(); this._relays = []; this.rl = null; this.via = null; this.setStatus('idle'); }
 
     _newPC() {
       if (this.pc) try { this.pc.close(); } catch (e) { }
       const pc = this.pc = new RTCPeerConnection({ iceServers: ICE });
-      pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed' && this.pc === pc) { if (this.role === 'host' && this.ws) { this.setStatus('waiting', 'online'); this.linkState = 'blocked'; this.emit('status', { status: 'waiting', detail: 'blocked' }); } else this.setStatus('failed', 'Found your friend\'s game, but your networks block a direct connection (often a work or government firewall). Try with one of you on home Wi-Fi or a phone hotspot.'); } if (pc.connectionState === 'disconnected') this.setStatus('lost', 'Connection lost.'); };
+      pc.onconnectionstatechange = () => { if (this.via === 'relay' || this._relayBusy) return; if (pc.connectionState === 'failed' && this.pc === pc) { if (this.role === 'host' && this.ws) { this.setStatus('waiting', 'online'); this.linkState = 'blocked'; this.emit('status', { status: 'waiting', detail: 'blocked' }); } else this.setStatus('failed', 'Found your friend\'s game, but your networks block a direct connection (often a work or government firewall). Try with one of you on home Wi-Fi or a phone hotspot.'); } if (pc.connectionState === 'disconnected') this.setStatus('lost', 'Connection lost.'); };
       pc.ondatachannel = (e) => this._setupDC(e.channel);
       return pc;
     }
     _waitIce(pc, ms = 5000) { return new Promise((res) => { if (pc.iceGatheringState === 'complete') return res(); const t = setTimeout(res, ms); pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); res(); } }); }); }
     _setupDC(dc) {
       this.dc = dc;
-      dc.onopen = () => { this.setStatus('connected'); const hi = () => this.send('hello', { name: this.name || 'Pilot', airline: this.airline || 'southwest', v: VERSION, ack: !!this.remoteInfo }); hi(); clearInterval(this._hi); let k = 0; this._hi = setInterval(() => { if (++k > 10 || (this.remoteInfo && this._ackd)) return clearInterval(this._hi); hi(); }, 1500); clearTimeout(this._iceTO); const w = this.ws; this.ws = null; try { w && w.close(); } catch (e) { } this._stopTicker(); };
+      dc.onopen = () => { this.via = 'direct'; this.linkState = 'online'; if (this.rl) { this.rl.close(); this.rl = null; } this._closeRelays(); this.setStatus('connected'); const hi = () => this.send('hello', { name: this.name || 'Pilot', airline: this.airline || 'southwest', v: VERSION, ack: !!this.remoteInfo }); hi(); clearInterval(this._hi); let k = 0; this._hi = setInterval(() => { if (++k > 10 || (this.remoteInfo && this._ackd)) return clearInterval(this._hi); hi(); }, 1500); clearTimeout(this._iceTO); const w = this.ws; this.ws = null; try { w && w.close(); } catch (e) { } this._stopTicker(); };
       dc.onclose = () => { if (this.status === 'connected') this.setStatus('lost', 'Your friend disconnected.'); };
       dc.onmessage = (e) => { let m; try { m = JSON.parse(e.data); } catch (x) { return; } this._msg(m); };
     }
@@ -18111,7 +18153,20 @@ void main(){
       else if (m.t === 'chat') { this.chat.push({ from: (this.remoteInfo && this.remoteInfo.name) || 'Friend', text: m.d.text }); this.emit('chat', m.d); }
       else this.emit(m.t, m.d);
     }
-    send(t, d) { if (this.dc && this.dc.readyState === 'open') { try { this.dc.send(JSON.stringify({ t, d })); } catch (e) { } } }
+    send(t, d) {
+      if (this.dc && this.dc.readyState === 'open') { try { this.dc.send(JSON.stringify({ t, d })); } catch (e) { } }
+      else if (this.via === 'relay' && this.rl) this.rl.pub(this.rOut, JSON.stringify({ g: this.gid, m: { t, d } }));
+    }
+    // the relay link is up: same start-up as an open data channel
+    _relayUp(rl, out) {
+      if (this.dc && this.dc.readyState === 'open') return;
+      this.rl = rl; this.rOut = out; this.via = 'relay'; clearTimeout(this._iceTO); clearTimeout(this._joinTO);
+      this.linkState = 'relay'; this.setStatus('connected', 'relay');
+      const hi = () => this.send('hello', { name: this.name || 'Pilot', airline: this.airline || 'southwest', v: VERSION, ack: !!this.remoteInfo });
+      hi(); clearInterval(this._hi); let k = 0; this._hi = setInterval(() => { if (++k > 10 || (this.remoteInfo && this._ackd)) return clearInterval(this._hi); hi(); }, 1500);
+      rl.onclose = () => { if (this.via === 'relay' && this.status === 'connected') this.setStatus('lost', 'The relay connection dropped.'); };
+    }
+    _closeRelays() { for (const r of this._relays || []) if (r !== this.rl || this.via !== 'relay') r.close(); this._relays = []; }
 
     // ---- copy-paste handshake
     async hostManual() {
@@ -18165,9 +18220,20 @@ void main(){
       this._reconn = false;
     }
     async hostOnline() {
-      this.role = 'host'; let ws, code;
-      for (let k = 0; k < 4; k++) { code = rid(6); this._tok = rid(10); try { ws = await this._broker('linepilot-' + code); break; } catch (e) { if (e.message !== 'ID-TAKEN' || k === 3) throw e; } }
-      this.code = code; this.setStatus('waiting', 'online');
+      this.role = 'host'; let ws = null, code, err = null;
+      const relP = relaysUp(8000);
+      for (let k = 0; k < 4; k++) { code = rid(6); this._tok = rid(10); try { ws = await this._broker('linepilot-' + code); break; } catch (e) { err = e; if (e.message !== 'ID-TAKEN' || k === 3) break; } }
+      const rels = await relP;
+      if (!ws && !rels.length) throw err || new Error('Could not reach any game server.');
+      this._relays = rels;
+      for (const rl of rels) rl.sub(TOPIC(code, 'h'), (s) => {
+        let m; try { m = JSON.parse(s); } catch (e) { return; }
+        if (!m || !m.g) return;
+        if (m.m && m.m.t === 'rhello') { if (this.connected && this.via === 'direct') return; this.gid = m.g; this._relayUp(rl, TOPIC(code, 'g' + m.g)); rl.pub(TOPIC(code, 'g' + m.g), JSON.stringify({ g: m.g, m: { t: 'rack', d: {} } })); return; }
+        if (this.via === 'relay' && this.rl === rl && m.g === this.gid && m.m) this._msg(m.m);
+      });
+      this.code = code; this.linkState = ws ? 'online' : 'relay-only'; this.setStatus('waiting', 'online');
+      if (!ws) return code;
       if (!this._vis) { this._vis = () => { if (document.visibilityState === 'visible' && this.role === 'host' && !this.connected && this.status === 'waiting' && (!this.ws || this.ws.readyState > 1)) this._brokerLost(); }; document.addEventListener('visibilitychange', this._vis); }
       this._onBroker = async (m) => {
         if (m.type === 'OFFER' && m.payload && m.payload.sdp) {
@@ -18185,15 +18251,38 @@ void main(){
     _watchIce(pc) {
       clearTimeout(this._iceTO);
       this._iceTO = setTimeout(() => {
-        if (this.pc !== pc || this.connected) return;
+        if (this.pc !== pc || this.connected || this._relayBusy) return;
         if (this.role === 'host') { this.setStatus('waiting', 'online'); this.linkState = 'blocked'; this.emit('status', { status: 'waiting', detail: 'blocked' }); }
         else this.setStatus('failed', 'Found your friend\'s game, but your two networks won\'t let the games talk directly. This usually means a work, school or government network firewall. Try again with one of you on home Wi-Fi or a phone hotspot.');
       }, 20000);
     }
+    // guest side of the relay: say hello on the host's topic until it answers
+    async _relayGuest(code) {
+      if (this._relayBusy || this.connected) return; this._relayBusy = true;
+      this.linkState = 'relay-try'; this.emit('status', { status: 'connecting', detail: 'relay' });
+      const rels = await relaysUp(8000); this._relays = rels;
+      if (this.connected) { this._closeRelays(); this._relayBusy = false; return; }
+      if (!rels.length) { this._relayBusy = false; this.setStatus('failed', 'Couldn\'t reach your friend directly or through the relay servers. Your network is probably blocking online games (common on work, school and government networks). Try home Wi-Fi or a phone hotspot, or use the copy-paste codes.'); return; }
+      this.gid = rid(10); let got = false;
+      for (const rl of rels) rl.sub(TOPIC(code, 'g' + this.gid), (s) => {
+        let m; try { m = JSON.parse(s); } catch (e) { return; } if (!m || !m.m) return;
+        if (m.m.t === 'rack') { if (!got && !(this.connected && this.via === 'direct')) { got = true; this._relayUp(rl, TOPIC(code, 'h')); } return; }
+        if (this.via === 'relay' && this.rl === rl) this._msg(m.m);
+      });
+      for (let k = 0; k < 15 && !got && !this.connected && this.role === 'guest'; k++) {
+        for (const rl of rels) rl.pub(TOPIC(code, 'h'), JSON.stringify({ g: this.gid, m: { t: 'rhello', d: {} } }));
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+      this._relayBusy = false;
+      if (!got && !this.connected && this.role === 'guest') { this._closeRelays(); this.setStatus('failed', `No game answered with code ${code}. Check the code, and make sure your friend's tab is still open on the "Fly with a friend" screen showing it.`); }
+    }
     async joinOnline(code) {
       code = String(code || '').trim().toUpperCase().replace(/^LINEPILOT-/, '').replace(/[^A-Z0-9]/g, '');
       if (code.length !== 6) throw new Error('The code has 6 letters and numbers.');
-      this.role = 'guest'; this._tok = rid(10); const ws = await this._broker('lpg-' + rid(12));
+      this.role = 'guest'; this._tok = rid(10); this._relayBusy = false;
+      // the relay starts on its own if the direct connection isn't up within 12 s (or right away if the code server is blocked)
+      clearTimeout(this._relayTO); this._relayTO = setTimeout(() => { if (this.role === 'guest' && !this.connected) this._relayGuest(code); }, 12000);
+      let ws; try { ws = await this._broker('lpg-' + rid(12)); } catch (e) { this.setStatus('connecting', 'relay'); this._relayGuest(code); return; }
       const pc = this._newPC(); this._setupDC(pc.createDataChannel('lp', { ordered: true }));
       await pc.setLocalDescription(await pc.createOffer()); await this._waitIce(pc);
       let tries = 0, answered = false;
@@ -18204,16 +18293,17 @@ void main(){
         if (m.type === 'EXPIRE' && !answered) {
           // the host may be reconnecting to the code server: keep asking for ~30 s before giving up
           if (++tries < 8) { this.linkState = 'searching'; this.emit('status', { status: 'connecting', detail: 'searching' }); setTimeout(() => { if (this.pc === pc && !answered) offer(); }, 4000); }
-          else this.setStatus('failed', `No game is online with code ${code}. Check the code, and make sure your friend's Line Pilot tab is still open on the "Fly with a friend" screen showing that code (if it says "reconnecting", wait for it).`);
+          else if (!this._relayBusy && this.via !== 'relay') this._relayGuest(code); else if (false) this.setStatus('failed', `No game is online with code ${code}. Check the code, and make sure your friend's Line Pilot tab is still open on the "Fly with a friend" screen showing that code (if it says "reconnecting", wait for it).`);
         }
       };
       offer(); this.setStatus('connecting', 'online');
-      clearTimeout(this._joinTO); this._joinTO = setTimeout(() => { if (this.pc === pc && this.status === 'connecting' && !answered) this.setStatus('failed', 'Your friend\'s game didn\'t answer. Check the code, or use the copy-paste codes.'); }, 45000);
+      clearTimeout(this._joinTO); this._joinTO = setTimeout(() => { if (this.pc === pc && this.status === 'connecting' && !answered && !this._relayBusy && this.via !== 'relay') this.setStatus('failed', 'Your friend\'s game didn\'t answer. Check the code, or use the copy-paste codes.'); }, 60000);
     }
 
     // ---- "Test my connection": can this computer reach the code server, and can it make direct links?
     async diagnose() {
-      const out = { broker: false, brokerErr: '', direct: false, types: [] };
+      const out = { broker: false, brokerErr: '', direct: false, types: [], relay: false };
+      const relP = relaysUp(8000).then((rs) => { out.relay = rs.length > 0; for (const r of rs) r.close(); });
       await new Promise((res) => {
         let ws; const done = (ok, e) => { clearTimeout(to); out.broker = ok; out.brokerErr = e || ''; try { ws && ws.close(); } catch (x) { } res(); };
         const to = setTimeout(() => done(false, 'no answer (blocked or very slow network)'), 9000);
@@ -18227,13 +18317,14 @@ void main(){
         await pc.setLocalDescription(await pc.createOffer()); await this._waitIce(pc, 6000); pc.close();
         out.direct = out.types.includes('srflx');
       } catch (e) { }
+      await relP;
       return out;
     }
 
     // ---- in flight: send our airplane ~10× a second
     tick(g) {
       if (!this.connected || !g.ac || !g.sys) return;
-      const now = performance.now(); if (now - this.lastSend < 100) return; this.lastSend = now;
+      const now = performance.now(); if (now - this.lastSend < (this.via === 'relay' ? 200 : 100)) return; this.lastSend = now;
       const ac = g.ac, st = g.sys.state || {}; const [lat, lon] = Geo.toLatLon(ac.pos[0], ac.pos[2]);
       this.send('st', { lat, lon, y: ac.pos[1], q: ac.q, v: ac.vel, gear: ac.gearPos, flap: ac.flapDeg, ll: !!g.ovhd.L_LAND, ph: g.logic ? g.logic.phase : '', air: !ac.onGround, ra: st.ra || 0, cas: st.cas || 0, alt: st.alt || 0, want: g._netWant || 1, rate: g.simRate, name: this.name, airline: this.airline, cs: g.callsign ? g.callsign.text : '', ended: !!g.ended, waiting: !!g.netWaiting, ft: g.flightTime });
     }
@@ -20346,7 +20437,7 @@ void main(){
       const st = net.status, who = net.remoteInfo ? net.remoteInfo.name : null;
       const row = (html) => { const d = h('div', { class: 'mprow', html }); el.append(d); return d; };
       if (net.connected) {
-        row(`<div class="mpok">👥 Connected with <b>${who || 'your friend'}</b>${net.remoteInfo ? ' · ' + ((Model737.LIVERIES[net.remoteInfo.airline] || {}).name || '') : ''}</div>`);
+        row(`<div class="mpok">👥 Connected with <b>${who || 'your friend'}</b>${net.remoteInfo ? ' · ' + ((Model737.LIVERIES[net.remoteInfo.airline] || {}).name || '') : ''}${net.via === 'relay' ? ' · <span title="Your computers could not link directly, so messages go through a relay server. Slightly less smooth.">via relay</span>' : ''}</div>`);
         row(net.role === 'host' ? `<div class="desc">You're the host. Pick the route above and press <b>Start flight</b>: ${who || 'your friend'} joins automatically and takes off right behind you.</div>` : `<div class="desc">${this.pendingPlan ? '' : 'Waiting for ' + (who || 'the host') + ' to pick a route and start…'}</div>`);
         if (net.role === 'guest' && this.pendingPlan) row('').append(h('button', { class: 'btn primary', onclick: () => this.joinPlan() }, 'Join the flight'));
         const chat = row('<input class="pname mpchat" maxlength="140" placeholder="Send a message…"/>');
@@ -20355,7 +20446,7 @@ void main(){
         return;
       }
       if (st === 'waiting' && net.code) {
-        row(`<div class="desc">Tell your friend this code. They open their copy of the game → Free flight → <b>Join</b>.</div><div class="mpcode">${net.code}</div><div class="desc">${net.linkState === 'reconnecting' ? '⚠️ Reconnecting to the code server… keep this tab open.' : net.linkState === 'blocked' ? '⚠️ Your friend found this game, but a firewall blocked the direct link between you. Work and government networks often do this. Try with one of you on home Wi-Fi or a phone hotspot, then have them press Join again.' : 'Waiting for them to join… <b>Keep this tab open</b> (it can be in the background).'}</div>`);
+        row(`<div class="desc">Tell your friend this code. They open their copy of the game → Free flight → <b>Join</b>.</div><div class="mpcode">${net.code}</div><div class="desc">${net.linkState === 'reconnecting' ? '⚠️ Reconnecting to the code server… keep this tab open.' : net.linkState === 'blocked' ? 'Your friend found this game but a direct link isn\'t possible; their game will switch to the relay server by itself. Keep this tab open.' : 'Waiting for them to join… <b>Keep this tab open</b> (it can be in the background).'}</div>`);
         row('').append(h('button', { class: 'btn ghost small', onclick: () => { net.close(); this._menu(); } }, 'Cancel'));
         return;
       }
@@ -20370,11 +20461,11 @@ void main(){
       btns.append(h('button', { class: 'btn', onclick: async () => { setName(); msg.textContent = 'Connecting…'; try { await net.joinOnline(jc.value); } catch (e) { msg.innerHTML = `${e.message}<br>Try <b>copy-paste codes</b> instead.`; } } }, 'Join'));
       row('').append(h('button', { class: 'btn ghost small', onclick: () => { setName(); this._mpManual = { step: 'choose' }; this._menu(); } }, 'Use copy-paste codes instead'));
       row('').append(h('button', { class: 'btn ghost small', onclick: async () => { msg.innerHTML = 'Testing this computer\'s connection… (about 15 s)'; const d = await net.diagnose();
-        msg.innerHTML = `<b>Code server:</b> ${d.broker ? '✅ reachable' : '❌ ' + d.brokerErr}<br><b>Direct link to other computers:</b> ${d.direct ? '✅ works' : '❌ blocked'}<br>` +
-          (d.broker && d.direct ? 'This computer is fine. Both players should run this test; whoever gets a ❌ is the problem. Both need the newest copy of the game file.' :
-           !d.direct ? 'This network blocks the direct game-to-game link (common on government, work and school networks). Two-player can\'t work from this network. Play from home Wi-Fi or a phone hotspot.' :
-           'The code server is blocked here, but direct links work: use <b>copy-paste codes</b> instead.'); } }, 'Test my connection'));
-      if (st === 'connecting') msg.textContent = net.detail === 'found' ? 'Found your friend\'s game — opening a direct link…' : net.linkState === 'searching' ? 'Looking for your friend\'s game…' : 'Connecting…';
+        msg.innerHTML = `<b>Code server:</b> ${d.broker ? '✅ reachable' : '❌ ' + d.brokerErr}<br><b>Direct link to other computers:</b> ${d.direct ? '✅ works' : '❌ blocked'}<br><b>Relay servers (backup):</b> ${d.relay ? '✅ reachable' : '❌ blocked'}<br>` +
+          (d.broker && d.direct ? 'This computer is fine. Both players should run this test; whoever gets a ❌ on all three is the problem. Both need the newest copy of the game.' :
+           d.relay ? 'The direct link may not work from here, but the relay backup is reachable, so two-player should still connect (it switches to the relay by itself after about 12 seconds).' :
+           'This network blocks online games completely (common on government, work and school networks). Play from home Wi-Fi or a phone hotspot.'); } }, 'Test my connection'));
+      if (st === 'connecting') msg.textContent = net.detail === 'found' ? 'Found your friend\'s game — opening a direct link…' : net.linkState === 'searching' ? 'Looking for your friend\'s game…' : net.linkState === 'relay-try' || net.detail === 'relay' ? 'No direct link — connecting through the relay server…' : 'Connecting…';
       if (st === 'failed' || st === 'lost') msg.textContent = net.detail || 'Not connected.';
     }
     _mpManualUI(el) {
